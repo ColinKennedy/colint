@@ -146,14 +146,26 @@ fn main() -> ExitCode {
             );
         }
     }
-    let errors = findings.iter().any(|f| f.severity == Severity::Error);
-    let warnings = findings.iter().any(|f| f.severity == Severity::Warning);
-    if errors {
-        ExitCode::from(2)
-    } else if warnings && (config.warnings_as_errors || cli.strict) {
-        ExitCode::from(1)
+    ExitCode::from(exit_status(
+        &findings,
+        config.warnings_as_errors || cli.strict,
+    ))
+}
+
+fn exit_status(findings: &[Finding], warnings_as_errors: bool) -> u8 {
+    if findings
+        .iter()
+        .any(|finding| finding.severity == Severity::Error)
+    {
+        2
+    } else if warnings_as_errors
+        && findings
+            .iter()
+            .any(|finding| finding.severity == Severity::Warning)
+    {
+        1
     } else {
-        ExitCode::SUCCESS
+        0
     }
 }
 
@@ -994,5 +1006,26 @@ def ignored():
         assert!(!analyze(Path::new("app.py"), source, &config, false)
             .iter()
             .any(|finding| finding.code == "COL-004"));
+    }
+
+    #[test]
+    fn exit_status_distinguishes_warnings_escalation_and_errors() {
+        let warning = findings(
+            "def run(value):\n    if not value:\n        return\n",
+            "app.py",
+        );
+        let error = findings("assert ready\n", "app.py");
+        assert_eq!(exit_status(&[], false), 0);
+        assert_eq!(exit_status(&warning, false), 0);
+        assert_eq!(exit_status(&warning, true), 1);
+        assert_eq!(exit_status(&error, false), 2);
+    }
+
+    #[test]
+    fn multiline_calls_and_import_groups_preserve_diagnostics() {
+        let source = "def run():\n    import os\n    import sys\n\nlogger.error(\n    'Failed for %s',\n    value,\n)\n";
+        let codes = codes(source, "app.py");
+        assert_eq!(codes.iter().filter(|code| *code == "COL-003").count(), 2);
+        assert!(codes.contains(&"COL-007".to_string()));
     }
 }
