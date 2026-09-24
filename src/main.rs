@@ -267,8 +267,16 @@ fn analyze(path: &Path, src: &str, config: &Config, strict: bool) -> Vec<Finding
         "call" => {
             check_call(&mut out, path, src, n, config, strict);
         }
-        "function_definition" => check_function(&mut out, path, src, n, config, strict),
-        "class_definition" => check_qt_model_subclass(&mut out, path, src, n, config, strict),
+        "function_definition" => {
+            check_function(&mut out, path, src, n, config, strict);
+            if !is_inside_class(n) {
+                check_widget_tooltips(&mut out, path, src, n, config, strict);
+            }
+        }
+        "class_definition" => {
+            check_qt_model_subclass(&mut out, path, src, n, config, strict);
+            check_class_widget_tooltips(&mut out, path, src, n, config, strict);
+        }
         "assert_statement" => check_pytest_assertion(&mut out, path, src, n, config, strict),
         "if_statement" => check_none_comparison(&mut out, path, src, n, config, strict),
         _ => {}
@@ -285,6 +293,16 @@ fn walk(node: Node, f: &mut impl FnMut(Node)) {
 }
 fn text<'a>(n: Node, src: &'a str) -> &'a str {
     &src[n.byte_range()]
+}
+fn is_inside_class(node: Node) -> bool {
+    let mut parent = node.parent();
+    while let Some(current) = parent {
+        if current.kind() == "class_definition" {
+            return true;
+        }
+        parent = current.parent();
+    }
+    false
 }
 fn enabled(code: &str, cfg: &Config, strict: bool) -> bool {
     strict || cfg.rules.get(code).copied().unwrap_or(true)
@@ -457,7 +475,6 @@ fn check_function(
     check_empty_string_returns(out, path, src, n, cfg, strict);
     check_lofting(out, path, src, n, cfg, strict);
     check_docstring_markup(out, path, src, n, &cfg.docstring_convention, cfg, strict);
-    check_widget_tooltips(out, path, src, n, cfg, strict);
     if let Some(b) = body {
         let first = b.named_child(0);
         if first.is_some_and(|x| x.kind() == "if_statement") {
@@ -750,6 +767,122 @@ fn check_widget_tooltips(
         }
     }
 }
+
+/// Check widgets constructed while initializing a class.  Configuration is often
+/// factored into helpers, so follow `self.method()` calls starting at `__init__`.
+/// The visited set deliberately makes recursive helper graphs finite.
+fn check_class_widget_tooltips(
+    out: &mut Vec<Finding>,
+    path: &Path,
+    src: &str,
+    class: Node,
+    cfg: &Config,
+    strict: bool,
+) {
+    let Some(body) = class.child_by_field_name("body") else {
+        return;
+    };
+    let mut methods = HashMap::new();
+    let mut cursor = body.walk();
+    for child in body.named_children(&mut cursor) {
+        if child.kind() == "function_definition" {
+            if let Some(name) = child.child_by_field_name("name") {
+                methods.insert(text(name, src).to_string(), child);
+            }
+        }
+    }
+    let Some(init) = methods.get("__init__").copied() else {
+        return;
+    };
+
+    let mut reachable = HashSet::new();
+    let mut pending = vec!["__init__".to_string()];
+    while let Some(name) = pending.pop() {
+        if !reachable.insert(name.clone()) {
+            continue;
+        }
+        let Some(method) = methods.get(&name).copied() else {
+            continue;
+        };
+        for called in called_instance_methods(method, src) {
+            if methods.contains_key(&called) && !reachable.contains(&called) {
+                pending.push(called);
+            }
+        }
+    }
+
+    let reachable_source = reachable
+        .iter()
+        .filter_map(|name| methods.get(name))
+        .map(|method| text(*method, src))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut widgets = HashSet::new();
+    for line in reachable_source.lines() {
+        let trimmed = line.trim();
+        if let Some((name, value)) = trimmed.split_once('=') {
+            if value.contains("Widget(")
+                || value.contains("Button(")
+                || value.contains("Label(")
+                || value.contains("ComboBox(")
+            {
+                widgets.insert(name.trim().trim_start_matches("self.").to_string());
+            }
+        }
+    }
+    for widget in widgets {
+        if !reachable_source.contains(&format!("{widget}.setToolTip("))
+            && !reachable_source.contains("no tooltip")
+        {
+            add(
+                out,
+                path,
+                src,
+                init,
+                "COL-013",
+                "widget has no static tooltip on every construction path",
+                cfg,
+                strict,
+            );
+        }
+    }
+}
+
+fn called_instance_methods(method: Node, src: &str) -> HashSet<String> {
+    let mut calls = HashSet::new();
+    let Some(body) = method.child_by_field_name("body") else {
+        return calls;
+    };
+    walk_method_nodes(body, &mut |node| {
+        if node.kind() != "call" {
+            return;
+        }
+        let Some(function) = node.child_by_field_name("function") else {
+            return;
+        };
+        let Some(attribute) = function.child_by_field_name("attribute") else {
+            return;
+        };
+        let Some(object) = function.child_by_field_name("object") else {
+            return;
+        };
+        if text(object, src) == "self" {
+            calls.insert(text(attribute, src).to_string());
+        }
+    });
+    calls
+}
+
+fn walk_method_nodes(node: Node, f: &mut impl FnMut(Node)) {
+    f(node);
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if matches!(child.kind(), "function_definition" | "class_definition") {
+            continue;
+        }
+        walk_method_nodes(child, f);
+    }
+}
 fn check_module_order(
     out: &mut Vec<Finding>,
     path: &Path,
@@ -953,6 +1086,54 @@ def ignored():
         );
         assert!(missing.contains(&"COL-013".to_string()));
         assert!(empty.contains(&"COL-013".to_string()));
+    }
+
+    #[test]
+    fn tooltip_helpers_reachable_from_init_are_accepted() {
+        let source = r#"
+class Window:
+    def __init__(self):
+        self.button = QPushButton()
+        self._configure()
+
+    def _configure(self):
+        self._set_button_tooltip()
+
+    def _set_button_tooltip(self):
+        self.button.setToolTip("Open the selected item")
+"#;
+        assert!(!codes(source, "app.py").contains(&"COL-013".to_string()));
+    }
+
+    #[test]
+    fn recursive_tooltip_helper_graphs_are_accepted() {
+        let source = r#"
+class Window:
+    def __init__(self):
+        self.button = QPushButton()
+        self._configure()
+
+    def _configure(self):
+        self._set_button_tooltip()
+
+    def _set_button_tooltip(self):
+        self._configure()
+        self.button.setToolTip("Open the selected item")
+"#;
+        assert!(!codes(source, "app.py").contains(&"COL-013".to_string()));
+    }
+
+    #[test]
+    fn unreachable_tooltip_helpers_do_not_satisfy_init_widgets() {
+        let source = r#"
+class Window:
+    def __init__(self):
+        self.button = QPushButton()
+
+    def _set_button_tooltip(self):
+        self.button.setToolTip("Open the selected item")
+"#;
+        assert!(codes(source, "app.py").contains(&"COL-013".to_string()));
     }
 
     #[test]
