@@ -31,6 +31,9 @@ Create `.colint.toml` in the working directory (or a parent directory):
 ```toml
 warnings_as_errors = false
 docstring_convention = "mkdocs"
+# Additional Python package roots used to resolve imported Qt model/proxy bases.
+# Relative paths are resolved from this configuration file.
+import_paths = ["../shared-python", "C:/work/company-python"]
 
 [rules]
 COL-003 = true
@@ -43,3 +46,6 @@ and ordinary warnings, `1` for warnings escalated to errors, and `2` whenever
 an error-level finding exists.
 
 `docstring_convention = "mkdocs"` enables the MkDocs parameter-markup check.
+`import_paths` supplements `PYTHONPATH` when `COL-014` resolves imported
+project classes. These roots are used for inheritance discovery only; colint
+does not emit findings for files that were loaded solely from an import path.

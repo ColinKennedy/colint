@@ -4,7 +4,7 @@ use clap::Parser;
 use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet},
-    fs,
+    env, fs,
     path::{Path, PathBuf},
     process::ExitCode,
 };
@@ -88,6 +88,10 @@ struct Config {
     /// The markup used when referring to parameters in docstrings.
     #[serde(default = "default_docstring_convention")]
     docstring_convention: String,
+    /// Extra package roots used when resolving imported base classes. Paths in
+    /// `.colint.toml` are relative to that file unless already absolute.
+    #[serde(default)]
+    import_paths: Vec<PathBuf>,
 }
 fn default_docstring_convention() -> String {
     "mkdocs".into()
@@ -98,6 +102,7 @@ impl Default for Config {
             warnings_as_errors: false,
             rules: HashMap::new(),
             docstring_convention: default_docstring_convention(),
+            import_paths: Vec::new(),
         }
     }
 }
@@ -117,12 +122,28 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let config = read_config(cli.config.as_deref());
     let files = python_files(&cli.paths);
+    let sources: Vec<_> = files
+        .into_iter()
+        .filter_map(|path| match fs::read_to_string(&path) {
+            Ok(source) => Some((path, source)),
+            Err(e) => {
+                eprintln!("colint: cannot read {}: {e}", path.display());
+                None
+            }
+        })
+        .collect();
+    let mut discovery_sources = sources.clone();
+    discovery_sources.extend(import_path_sources(&config));
+    let qt_model_classes = qt_model_classes(&discovery_sources);
     let mut findings = Vec::new();
-    for path in files {
-        match fs::read_to_string(&path) {
-            Ok(source) => findings.extend(analyze(&path, &source, &config, cli.strict)),
-            Err(e) => eprintln!("colint: cannot read {}: {e}", path.display()),
-        }
+    for (path, source) in sources {
+        findings.extend(analyze_with_qt_model_classes(
+            &path,
+            &source,
+            &config,
+            cli.strict,
+            &qt_model_classes,
+        ));
     }
     findings.sort_by(|a, b| {
         (&a.path, a.line, a.column, &a.code).cmp(&(&b.path, b.line, b.column, &b.code))
@@ -182,9 +203,37 @@ fn read_config(explicit: Option<&Path>) -> Config {
             }
         }
     });
-    path.and_then(|p| fs::read_to_string(p).ok())
+    let Some(path) = path else {
+        return Config::default();
+    };
+    let mut config: Config = fs::read_to_string(&path)
+        .ok()
         .and_then(|s| toml::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let base = path.parent().unwrap_or_else(|| Path::new("."));
+    config.import_paths = config
+        .import_paths
+        .into_iter()
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                base.join(path)
+            }
+        })
+        .collect();
+    config
+}
+
+fn import_path_sources(config: &Config) -> Vec<(PathBuf, String)> {
+    let mut roots = config.import_paths.clone();
+    if let Some(paths) = env::var_os("PYTHONPATH") {
+        roots.extend(env::split_paths(&paths));
+    }
+    python_files(&roots)
+        .into_iter()
+        .filter_map(|path| fs::read_to_string(&path).ok().map(|source| (path, source)))
+        .collect()
 }
 fn ignored(entry: &DirEntry) -> bool {
     entry.file_type().is_dir()
@@ -224,7 +273,18 @@ fn python_files(paths: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
+#[cfg(test)]
 fn analyze(path: &Path, src: &str, config: &Config, strict: bool) -> Vec<Finding> {
+    analyze_with_qt_model_classes(path, src, config, strict, &HashSet::new())
+}
+
+fn analyze_with_qt_model_classes(
+    path: &Path,
+    src: &str,
+    config: &Config,
+    strict: bool,
+    qt_model_classes: &HashSet<String>,
+) -> Vec<Finding> {
     let mut parser = TsParser::new();
     parser
         .set_language(&tree_sitter_python::LANGUAGE.into())
@@ -274,7 +334,7 @@ fn analyze(path: &Path, src: &str, config: &Config, strict: bool) -> Vec<Finding
             }
         }
         "class_definition" => {
-            check_qt_model_subclass(&mut out, path, src, n, config, strict);
+            check_qt_model_subclass(&mut out, path, src, n, qt_model_classes, config, strict);
             check_class_widget_tooltips(&mut out, path, src, n, config, strict);
         }
         "assert_statement" => check_pytest_assertion(&mut out, path, src, n, config, strict),
@@ -528,14 +588,18 @@ fn check_qt_model_subclass(
     path: &Path,
     src: &str,
     class: Node,
+    qt_model_classes: &HashSet<String>,
     cfg: &Config,
     strict: bool,
 ) {
     let Some(superclasses) = class.child_by_field_name("superclasses") else {
         return;
     };
-    let base_text = text(superclasses, src);
-    if !(base_text.contains("QStandardItemModel") || base_text.contains("QSortFilterProxyModel")) {
+    let bases = class_base_names(superclasses, src);
+    if !bases
+        .iter()
+        .any(|base| is_qt_model_base(base) || qt_model_classes.contains(base))
+    {
         return;
     }
     let class_text = text(class, src);
@@ -555,6 +619,107 @@ fn check_qt_model_subclass(
             strict,
         );
     }
+}
+
+/// Finds Qt model/proxy subclasses across all input files.  This deliberately
+/// uses imported symbol names rather than module paths: it lets a class inherit
+/// from a project-local model imported with an alias, while keeping the rule a
+/// lightweight static check.
+fn qt_model_classes(sources: &[(PathBuf, String)]) -> HashSet<String> {
+    let mut classes = Vec::new();
+    let mut aliases = Vec::new();
+    for (_, src) in sources {
+        let mut parser = TsParser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .expect("Python grammar");
+        let Some(tree) = parser.parse(src, None) else {
+            continue;
+        };
+        walk(tree.root_node(), &mut |node| match node.kind() {
+            "class_definition" => {
+                if let (Some(name), Some(superclasses)) = (
+                    node.child_by_field_name("name"),
+                    node.child_by_field_name("superclasses"),
+                ) {
+                    classes.push((
+                        text(name, src).to_string(),
+                        class_base_names(superclasses, src),
+                    ));
+                }
+            }
+            "import_from_statement" => aliases.extend(imported_aliases(text(node, src))),
+            _ => {}
+        });
+    }
+
+    let mut known = HashSet::new();
+    loop {
+        let before = known.len();
+        for (name, bases) in &classes {
+            if bases
+                .iter()
+                .any(|base| is_qt_model_base(base) || known.contains(base))
+            {
+                known.insert(name.clone());
+            }
+        }
+        for (original, alias) in &aliases {
+            if known.contains(original) {
+                known.insert(alias.clone());
+            }
+        }
+        if known.len() == before {
+            return known;
+        }
+    }
+}
+
+fn is_qt_model_base(name: &str) -> bool {
+    matches!(
+        name,
+        "QAbstractItemModel"
+            | "QAbstractListModel"
+            | "QAbstractTableModel"
+            | "QAbstractProxyModel"
+            | "QIdentityProxyModel"
+            | "QSortFilterProxyModel"
+            | "QStandardItemModel"
+    )
+}
+
+fn class_base_names(superclasses: Node, src: &str) -> Vec<String> {
+    text(superclasses, src)
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .split(',')
+        .filter_map(|base| base.trim().rsplit('.').next())
+        .map(|base| base.trim().to_string())
+        .filter(|base| !base.is_empty())
+        .collect()
+}
+
+fn imported_aliases(statement: &str) -> Vec<(String, String)> {
+    let normalized = statement.replace('\n', " ");
+    let Some((_, imported)) = normalized.split_once(" import ") else {
+        return vec![];
+    };
+    imported
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .split(',')
+        .filter_map(|item| {
+            let mut parts = item.split_whitespace();
+            let original = parts.next()?;
+            let alias = match (parts.next(), parts.next()) {
+                (Some("as"), Some(alias)) => alias,
+                _ => original,
+            };
+            Some((original.to_string(), alias.to_string()))
+        })
+        .collect()
 }
 fn check_none_comparison(
     out: &mut Vec<Finding>,
@@ -981,6 +1146,7 @@ def ignored():
             warnings_as_errors: false,
             rules: HashMap::from([("COL-010".to_string(), false)]),
             docstring_convention: default_docstring_convention(),
+            import_paths: Vec::new(),
         };
         let normal = analyze(
             Path::new("production.py"),
@@ -1145,6 +1311,56 @@ class Window:
     }
 
     #[test]
+    fn qt_model_parent_is_required_for_subclasses_of_imported_project_models() {
+        let sources = vec![
+            (
+                PathBuf::from("models.py"),
+                "class ProjectModel(QStandardItemModel):\n    def __init__(self, parent):\n        super().__init__(parent)\n"
+                    .to_string(),
+            ),
+            (
+                PathBuf::from("views.py"),
+                "from models import ProjectModel as BaseModel\n\nclass ViewModel(BaseModel):\n    pass\n"
+                    .to_string(),
+            ),
+        ];
+        let known = qt_model_classes(&sources);
+        let findings = analyze_with_qt_model_classes(
+            Path::new("views.py"),
+            &sources[1].1,
+            &Config::default(),
+            false,
+            &known,
+        );
+        assert!(findings.iter().any(|finding| finding.code == "COL-014"));
+    }
+
+    #[test]
+    fn abstract_qt_proxy_models_are_tracked_through_imports() {
+        let sources = vec![
+            (
+                PathBuf::from("shared/models.py"),
+                "class ProjectProxy(QAbstractProxyModel):\n    def __init__(self, parent):\n        super().__init__(parent)\n"
+                    .to_string(),
+            ),
+            (
+                PathBuf::from("app/view.py"),
+                "from shared.models import ProjectProxy\n\nclass ViewProxy(ProjectProxy):\n    pass\n"
+                    .to_string(),
+            ),
+        ];
+        let known = qt_model_classes(&sources);
+        let findings = analyze_with_qt_model_classes(
+            Path::new("app/view.py"),
+            &sources[1].1,
+            &Config::default(),
+            false,
+            &known,
+        );
+        assert!(findings.iter().any(|finding| finding.code == "COL-014"));
+    }
+
+    #[test]
     fn noqa_and_selected_suppressions_do_not_overreach() {
         assert!(codes(
             "def run():\n    import os  # colint: ignore[COL-010]\n",
@@ -1166,6 +1382,7 @@ class Window:
             warnings_as_errors: false,
             rules: HashMap::from([("COL-001".to_string(), false)]),
             docstring_convention: default_docstring_convention(),
+            import_paths: Vec::new(),
         };
         let source = "def run(value):\n    if not value:\n        return\n    work()\n";
         assert!(!analyze(Path::new("app.py"), source, &config, false)
@@ -1182,6 +1399,7 @@ class Window:
             warnings_as_errors: false,
             rules: HashMap::new(),
             docstring_convention: "google".to_string(),
+            import_paths: Vec::new(),
         };
         let source = "def create(task):\n    \"\"\"Create *task*.\"\"\"\n";
         assert!(!analyze(Path::new("app.py"), source, &config, false)
