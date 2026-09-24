@@ -1,11 +1,11 @@
-name: Publish to PyPI
+name: Release and publish to PyPI
 
 on:
-  release:
-    types: [published]
+  push:
+    tags: ["v*"]
 
 permissions:
-  contents: read
+  contents: write
   id-token: write
 
 jobs:
@@ -34,9 +34,24 @@ jobs:
           name: wheels-${{ matrix.os }}
           path: dist
 
-  publish:
-    name: Publish colint
+  release:
+    name: Create GitHub release
     needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/*
+
+  publish:
+    name: Publish colint to PyPI
+    needs: release
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

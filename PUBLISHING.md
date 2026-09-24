@@ -17,6 +17,6 @@ colint --help
 
 1. Update the matching versions in `Cargo.toml` and `pyproject.toml`.
 2. Run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --all-targets`.
-3. Create and publish a GitHub release tagged `vX.Y.Z`.
+3. Create and push a matching annotated tag, for example `git tag -a v0.1.0 -m "v0.1.0"; git push origin v0.1.0`.
 
-The release workflow builds platform wheels and an sdist, then publishes the assembled artifacts through PyPI trusted publishing.
+Pushing a `v*` tag builds platform wheels and an sdist, creates a GitHub Release with those artifacts attached, then publishes the assembled artifacts through PyPI trusted publishing.
