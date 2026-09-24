@@ -1,0 +1,45 @@
+# colint
+
+`colint` is an MIT-licensed Rust command-line linter for opinionated Python
+code reviews. It parses Python with Tree-sitter, so diagnostics include stable
+source locations even for multiline expressions.
+
+## Install
+
+Once published, install the `ColinKennedy` PyPI distribution with:
+
+```powershell
+python -m pip install colint
+```
+
+```powershell
+cargo run -- path\to\project
+cargo run -- --strict --json src
+```
+
+Contributors can run the same quality gates as CI with `cargo fmt --check`,
+`cargo clippy --all-targets -- -D warnings`, and `cargo test --all-targets`.
+
+Rules have stable codes in the `COL-NNN` form. A line may suppress all findings
+with `# noqa`, or selected findings with `# colint: ignore[COL-003,COL-010]`.
+The complete agreed rule and behavior contract is in [DESIGN.md](DESIGN.md).
+
+## Configuration
+
+Create `.colint.toml` in the working directory (or a parent directory):
+
+```toml
+warnings_as_errors = false
+docstring_convention = "mkdocs"
+
+[rules]
+COL-003 = true
+COL-013 = false
+```
+
+Every rule is enabled by default. `--strict` enables every rule regardless of
+configuration and treats warnings as errors. Exit status is `0` for clean runs
+and ordinary warnings, `1` for warnings escalated to errors, and `2` whenever
+an error-level finding exists.
+
+`docstring_convention = "mkdocs"` enables the MkDocs parameter-markup check.

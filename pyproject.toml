@@ -1,0 +1,28 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "colint"
+version = "0.1.0"
+description = "Opinionated static analysis for Python"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Colin Kennedy", email = "colinvfx@gmail.com" }]
+keywords = ["lint", "linter", "python", "static-analysis"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Software Development :: Quality Assurance",
+]
+
+[tool.maturin]
+# Package the Rust executable as the `colint` command in wheels.
+bindings = "bin"
+compatibility = "pypi"
+strip = true

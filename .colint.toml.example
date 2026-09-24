@@ -1,0 +1,10 @@
+# Warnings remain successful unless this is true.
+warnings_as_errors = false
+
+# Currently supported: "mkdocs". In MkDocs docstrings, parameters are written
+# as `parameter`, not *parameter*.
+docstring_convention = "mkdocs"
+
+# Set any rule to false to disable it. --strict overrides these choices.
+[rules]
+# COL-003 = false
