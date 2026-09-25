@@ -327,6 +327,7 @@ fn analyze_with_qt_model_classes(
     let mut out = Vec::new();
     let root = tree.root_node();
     let defined_returns = local_return_types(root, src);
+    let custom_widget_classes = custom_widget_classes(root, src);
     walk(root, &mut |n| match n.kind() {
         "import_statement" | "import_from_statement"
             if n.parent().is_some_and(|p| p.kind() != "module") =>
@@ -354,7 +355,18 @@ fn analyze_with_qt_model_classes(
             config,
             strict,
         ),
-        "assignment" => check_assignment(&mut out, path, src, n, &defined_returns, config, strict),
+        "assignment" => {
+            check_assignment(&mut out, path, src, n, &defined_returns, config, strict);
+            check_custom_widget_instance(
+                &mut out,
+                path,
+                src,
+                n,
+                &custom_widget_classes,
+                config,
+                strict,
+            );
+        }
         "call" => {
             check_call(&mut out, path, src, n, config, strict);
         }
@@ -374,6 +386,67 @@ fn analyze_with_qt_model_classes(
     });
     check_module_order(&mut out, path, src, root, config, strict);
     out
+}
+
+fn custom_widget_classes(root: Node, src: &str) -> HashSet<String> {
+    let mut classes = HashSet::new();
+    walk(root, &mut |node| {
+        if node.kind() != "class_definition" {
+            return;
+        }
+        let (Some(name), Some(superclasses)) = (
+            node.child_by_field_name("name"),
+            node.child_by_field_name("superclasses"),
+        ) else {
+            return;
+        };
+        if text(superclasses, src).contains("Widget") {
+            classes.insert(text(name, src).to_string());
+        }
+    });
+    classes
+}
+
+fn check_custom_widget_instance(
+    out: &mut Vec<Finding>,
+    path: &Path,
+    src: &str,
+    assignment: Node,
+    custom_widget_classes: &HashSet<String>,
+    cfg: &Config,
+    strict: bool,
+) {
+    let Some((left, right)) = text(assignment, src).split_once('=') else {
+        return;
+    };
+    let instance = left.trim().trim_start_matches("self.");
+    let constructor = right.trim().split('(').next().unwrap_or("").trim();
+    if instance.is_empty() || !custom_widget_classes.contains(constructor) {
+        return;
+    }
+    let mut scope = assignment;
+    while let Some(parent) = scope.parent() {
+        scope = parent;
+        if matches!(
+            scope.kind(),
+            "module" | "function_definition" | "class_definition"
+        ) {
+            break;
+        }
+    }
+    let scope = text(scope, src);
+    if !scope.contains(&format!("{instance}.setToolTip(")) && !scope.contains("no tooltip") {
+        add(
+            out,
+            path,
+            src,
+            assignment,
+            "COL-013",
+            "widget has no static tooltip on every construction path",
+            cfg,
+            strict,
+        );
+    }
 }
 fn walk(node: Node, f: &mut impl FnMut(Node)) {
     f(node);
@@ -1553,6 +1626,32 @@ def run():
         );
         assert!(missing.contains(&"COL-013".to_string()));
         assert!(empty.contains(&"COL-013".to_string()));
+    }
+
+    #[test]
+    fn custom_widget_definitions_are_not_instances_but_instances_need_tooltips() {
+        let fixture = include_str!("../tip.txt");
+        let fixture_findings = findings(fixture, "tip.txt");
+        let fixture_codes = fixture_findings
+            .iter()
+            .map(|finding| format!("{}:{}: {}", finding.code, finding.line, finding.message))
+            .collect::<Vec<_>>();
+        assert!(
+            !fixture_findings
+                .iter()
+                .any(|finding| finding.code == "COL-013"),
+            "unexpected findings: {fixture_codes:?}"
+        );
+
+        let missing = r#"
+class CustomWidget(QtWidgets.QWidget):
+    def __init__(self):
+        self.label = QtWidgets.QLabel()
+        self.label.setToolTip("Label")
+
+widget = CustomWidget()
+"#;
+        assert!(codes(missing, "app.py").contains(&"COL-013".to_string()));
     }
 
     #[test]
