@@ -1,0 +1,23 @@
+class CustomClass(QtWidgets.QWidget):
+    def __init__(self):
+        self._foo = QtWidgets.QLabel()
+        self._foo.setToolTip("foo thing")
+        self._bar = QtWidgets.QLabel()
+        self._fizz = QtWidgets.QLabel()
+
+        self._init_stuff()
+        self._init_nested()
+
+    def _init_stuff(self):
+        self._bar.setToolTip("bar information")
+
+    def _init_nested(self):
+        self._something_else()
+
+    def _something_else(self):
+        self._fizz.setToolTip("asfdsadfasfd")
+
+
+
+widget = CustomClass()
+widget.setToolTip("TIP HERE")

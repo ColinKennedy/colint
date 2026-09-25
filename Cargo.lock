@@ -116,6 +116,7 @@ name = "colint"
 version = "0.2.0"
 dependencies = [
  "clap",
+ "regex",
  "serde",
  "serde_json",
  "toml",

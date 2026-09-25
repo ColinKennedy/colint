@@ -1,6 +1,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use clap::Parser;
+use regex::Regex;
 use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet},
@@ -75,6 +76,9 @@ struct Cli {
     /// Emit machine-readable diagnostics
     #[arg(long)]
     json: bool,
+    /// Prepend guidance for reading and suppressing diagnostics
+    #[arg(long)]
+    include_header: bool,
     /// Use this configuration file instead of discovering .colint.toml
     #[arg(long)]
     config: Option<PathBuf>,
@@ -88,6 +92,9 @@ struct Config {
     /// The markup used when referring to parameters in docstrings.
     #[serde(default = "default_docstring_convention")]
     docstring_convention: String,
+    /// Whether COL-002 skips underscore-prefixed functions, methods, and classes.
+    #[serde(default = "default_col002_skip_private_definitions")]
+    col002_skip_private_definitions: bool,
     /// Extra package roots used when resolving imported base classes. Paths in
     /// `.colint.toml` are relative to that file unless already absolute.
     #[serde(default)]
@@ -96,12 +103,16 @@ struct Config {
 fn default_docstring_convention() -> String {
     "mkdocs".into()
 }
+fn default_col002_skip_private_definitions() -> bool {
+    true
+}
 impl Default for Config {
     fn default() -> Self {
         Self {
             warnings_as_errors: false,
             rules: HashMap::new(),
             docstring_convention: default_docstring_convention(),
+            col002_skip_private_definitions: default_col002_skip_private_definitions(),
             import_paths: Vec::new(),
         }
     }
@@ -151,26 +162,46 @@ fn main() -> ExitCode {
     if cli.json {
         println!("{}", serde_json::to_string_pretty(&findings).unwrap());
     } else {
-        for f in &findings {
-            println!(
-                "{}:{}:{}: {} - {} [{}]\\n  recommendation: {}",
-                f.path,
-                f.line,
-                f.column,
-                f.code,
-                f.message,
-                match f.severity {
-                    Severity::Warning => "warning",
-                    Severity::Error => "error",
-                },
-                f.recommendation
-            );
-        }
+        print!("{}", format_human_output(&findings, cli.include_header));
     }
     ExitCode::from(exit_status(
         &findings,
         config.warnings_as_errors || cli.strict,
     ))
+}
+
+fn format_human_finding(finding: &Finding) -> String {
+    format!(
+        "{}:{}:{}: {} - {} [{}]\n  recommendation: {}",
+        finding.path,
+        finding.line,
+        finding.column,
+        finding.code,
+        finding.message,
+        match finding.severity {
+            Severity::Warning => "warning",
+            Severity::Error => "error",
+        },
+        finding.recommendation
+    )
+}
+
+const HUMAN_OUTPUT_HEADER: &str = "colint diagnostics\n\
+Suppress a finding on its line with `# noqa`, or selected codes with\n\
+`# colint: ignore[COL-003,COL-010]`. For COL-003 nested imports, use\n\
+`# NOTE: reason` immediately above one import or an import group; blank lines\n\
+do not end that group.\n\n";
+
+fn format_human_output(findings: &[Finding], include_header: bool) -> String {
+    let mut output = String::new();
+    if include_header {
+        output.push_str(HUMAN_OUTPUT_HEADER);
+    }
+    for finding in findings {
+        output.push_str(&format_human_finding(finding));
+        output.push('\n');
+    }
+    output
 }
 
 fn exit_status(findings: &[Finding], warnings_as_errors: bool) -> u8 {
@@ -296,6 +327,7 @@ fn analyze_with_qt_model_classes(
     let mut out = Vec::new();
     let root = tree.root_node();
     let defined_returns = local_return_types(root, src);
+    let custom_widget_classes = custom_widget_classes(root, src);
     walk(root, &mut |n| match n.kind() {
         "import_statement" | "import_from_statement"
             if n.parent().is_some_and(|p| p.kind() != "module") =>
@@ -323,7 +355,18 @@ fn analyze_with_qt_model_classes(
             config,
             strict,
         ),
-        "assignment" => check_assignment(&mut out, path, src, n, &defined_returns, config, strict),
+        "assignment" => {
+            check_assignment(&mut out, path, src, n, &defined_returns, config, strict);
+            check_custom_widget_instance(
+                &mut out,
+                path,
+                src,
+                n,
+                &custom_widget_classes,
+                config,
+                strict,
+            );
+        }
         "call" => {
             check_call(&mut out, path, src, n, config, strict);
         }
@@ -343,6 +386,67 @@ fn analyze_with_qt_model_classes(
     });
     check_module_order(&mut out, path, src, root, config, strict);
     out
+}
+
+fn custom_widget_classes(root: Node, src: &str) -> HashSet<String> {
+    let mut classes = HashSet::new();
+    walk(root, &mut |node| {
+        if node.kind() != "class_definition" {
+            return;
+        }
+        let (Some(name), Some(superclasses)) = (
+            node.child_by_field_name("name"),
+            node.child_by_field_name("superclasses"),
+        ) else {
+            return;
+        };
+        if text(superclasses, src).contains("Widget") {
+            classes.insert(text(name, src).to_string());
+        }
+    });
+    classes
+}
+
+fn check_custom_widget_instance(
+    out: &mut Vec<Finding>,
+    path: &Path,
+    src: &str,
+    assignment: Node,
+    custom_widget_classes: &HashSet<String>,
+    cfg: &Config,
+    strict: bool,
+) {
+    let Some((left, right)) = text(assignment, src).split_once('=') else {
+        return;
+    };
+    let instance = left.trim().trim_start_matches("self.");
+    let constructor = right.trim().split('(').next().unwrap_or("").trim();
+    if instance.is_empty() || !custom_widget_classes.contains(constructor) {
+        return;
+    }
+    let mut scope = assignment;
+    while let Some(parent) = scope.parent() {
+        scope = parent;
+        if matches!(
+            scope.kind(),
+            "module" | "function_definition" | "class_definition"
+        ) {
+            break;
+        }
+    }
+    let scope = text(scope, src);
+    if !scope.contains(&format!("{instance}.setToolTip(")) && !scope.contains("no tooltip") {
+        add(
+            out,
+            path,
+            src,
+            assignment,
+            "COL-013",
+            "widget has no static tooltip on every construction path",
+            cfg,
+            strict,
+        );
+    }
 }
 fn walk(node: Node, f: &mut impl FnMut(Node)) {
     f(node);
@@ -407,7 +511,8 @@ fn add(
 }
 
 fn nested_import_has_note(n: Node, src: &str) -> bool {
-    let before = &src[..n.start_byte()];
+    let first_in_group = first_import_in_group(n);
+    let before = &src[..first_in_group.start_byte()];
     let mut meaningful = before.lines().rev().filter(|l| !l.trim().is_empty());
     match meaningful.next() {
         Some(line) if line.trim_start().starts_with('#') => {
@@ -425,6 +530,33 @@ fn nested_import_has_note(n: Node, src: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// Returns the first consecutive nested import in this block. Comments and
+/// whitespace are not named syntax nodes, so they naturally do not split a
+/// group; multiline imports remain one Tree-sitter statement.
+fn first_import_in_group(n: Node) -> Node {
+    let Some(parent) = n.parent() else {
+        return n;
+    };
+    let mut imports = Vec::new();
+    let mut cursor = parent.walk();
+    for child in parent.named_children(&mut cursor) {
+        if child.end_byte() <= n.start_byte() {
+            imports.push(child);
+        } else {
+            break;
+        }
+    }
+    let mut first = n;
+    for child in imports.into_iter().rev() {
+        if matches!(child.kind(), "import_statement" | "import_from_statement") {
+            first = child;
+        } else {
+            break;
+        }
+    }
+    first
 }
 fn local_return_types(root: Node, src: &str) -> HashMap<String, String> {
     let mut x = HashMap::new();
@@ -533,7 +665,9 @@ fn check_function(
     let t = text(n, src);
     let body = n.child_by_field_name("body");
     check_empty_string_returns(out, path, src, n, cfg, strict);
-    check_lofting(out, path, src, n, cfg, strict);
+    if !cfg.col002_skip_private_definitions || !is_private_definition(n, src) {
+        check_lofting(out, path, src, n, cfg, strict);
+    }
     check_docstring_markup(out, path, src, n, &cfg.docstring_convention, cfg, strict);
     if let Some(b) = body {
         let first = b.named_child(0);
@@ -568,6 +702,29 @@ fn check_function(
             );
         }
     }
+}
+
+/// A definition is private when its own name starts with `_`, or when it is a
+/// method of a class whose name starts with `_`. This includes dunder members.
+fn is_private_definition(function: Node, src: &str) -> bool {
+    if function
+        .child_by_field_name("name")
+        .is_some_and(|name| text(name, src).starts_with('_'))
+    {
+        return true;
+    }
+    let mut parent = function.parent();
+    while let Some(node) = parent {
+        if node.kind() == "class_definition"
+            && node
+                .child_by_field_name("name")
+                .is_some_and(|name| text(name, src).starts_with('_'))
+        {
+            return true;
+        }
+        parent = node.parent();
+    }
+    false
 }
 
 fn contains_direct_kind(node: Node, kind: &str) -> bool {
@@ -795,6 +952,7 @@ fn check_lofting(
         return;
     };
     let body_text = text(body, src);
+    let mut candidates = Vec::new();
     let mut cursor = parameters.walk();
     for parameter in parameters.named_children(&mut cursor) {
         let parameter_text = text(parameter, src);
@@ -802,13 +960,88 @@ fn check_lofting(
         if name.is_empty() || name == "self" || name == "cls" {
             continue;
         }
-        let uses: Vec<_> = body_text.match_indices(name).collect();
-        if uses.len() == 1 {
-            let suffix = &body_text[uses[0].0 + name.len()..];
-            if suffix.trim_start().starts_with('.') {
-                add(out, path, src, function, "COL-002", "parameter is only queried once; consider lofting the queried value into the caller", cfg, strict);
-            }
+        let query = Regex::new(&format!(r"\b{}\.[A-Za-z_]\w*\s*\(", regex::escape(name)))
+            .expect("escaped parameter name is a valid regex");
+        if query.find_iter(body_text).count() == 1
+            && Regex::new(&format!(r"\b{}\b", regex::escape(name)))
+                .expect("escaped parameter name is a valid regex")
+                .find_iter(body_text)
+                .count()
+                == 1
+        {
+            candidates.push((name.to_string(), lofting_target(body_text, name)));
         }
+    }
+    if candidates.is_empty() {
+        return;
+    }
+    let names = candidates
+        .iter()
+        .map(|(name, _)| format!("`{name}`"))
+        .collect::<Vec<_>>();
+    let parameters = join_human(&names);
+    let targets = candidates
+        .iter()
+        .filter_map(|(_, target)| target.as_deref())
+        .collect::<HashSet<_>>();
+    let singular = candidates.len() == 1;
+    let message = if targets.len() == 1 && candidates.iter().all(|(_, target)| target.is_some()) {
+        format!(
+            "{} {} {} only queried once; loft {} queried {} to `{}`",
+            if singular { "parameter" } else { "parameters" },
+            parameters,
+            if singular { "is" } else { "are" },
+            if singular { "its" } else { "their" },
+            if singular { "value" } else { "values" },
+            targets.into_iter().next().expect("one target"),
+        )
+    } else {
+        format!(
+            "{} {} {} only queried once; loft {} queried {} into the caller",
+            if singular { "parameter" } else { "parameters" },
+            parameters,
+            if singular { "is" } else { "are" },
+            if singular { "its" } else { "their" },
+            if singular { "value" } else { "values" },
+        )
+    };
+    add(out, path, src, function, "COL-002", &message, cfg, strict);
+}
+
+fn lofting_target(body: &str, parameter: &str) -> Option<String> {
+    let escaped = regex::escape(parameter);
+    let direct = Regex::new(&format!(r"\b([A-Za-z_]\w*)\s*\([^\n]*\b{}\.", escaped))
+        .expect("escaped parameter name is a valid regex");
+    if let Some(captures) = direct.captures(body) {
+        return captures.get(1).map(|target| target.as_str().to_string());
+    }
+    let assigned = Regex::new(&format!(
+        r"\b([A-Za-z_]\w*)\s*=\s*{}\.[A-Za-z_]\w*\s*\(",
+        escaped
+    ))
+    .expect("escaped parameter name is a valid regex");
+    let value = assigned.captures(body)?.get(1)?.as_str();
+    let consumer = Regex::new(&format!(
+        r"\b([A-Za-z_]\w*)\s*\(\s*{}\b",
+        regex::escape(value)
+    ))
+    .expect("captured local name is a valid regex");
+    consumer
+        .captures(body)
+        .and_then(|captures| captures.get(1))
+        .map(|target| target.as_str().to_string())
+}
+
+fn join_human(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [item] => item.clone(),
+        [first, second] => format!("{first} and {second}"),
+        _ => format!(
+            "{}, and {}",
+            items[..items.len() - 1].join(", "),
+            items.last().unwrap()
+        ),
     }
 }
 
@@ -1109,6 +1342,49 @@ mod tests {
     }
 
     #[test]
+    fn human_findings_use_real_newlines() {
+        let finding = Finding {
+            path: "app.py".into(),
+            line: 2,
+            column: 5,
+            code: "COL-010".into(),
+            name: "assert-in-production".into(),
+            severity: Severity::Error,
+            message: "assert is used outside test code".into(),
+            recommendation: "Raise an explicit exception instead of assert in non-test code."
+                .into(),
+        };
+        let rendered = format_human_finding(&finding);
+        assert!(rendered.contains('\n'));
+        assert!(!rendered.contains(r"\n"));
+        assert_eq!(rendered.lines().count(), 2);
+    }
+
+    #[test]
+    fn human_output_header_is_opt_in() {
+        let finding = Finding {
+            path: "app.py".into(),
+            line: 1,
+            column: 1,
+            code: "COL-010".into(),
+            name: "assert-in-production".into(),
+            severity: Severity::Error,
+            message: "assert is used outside test code".into(),
+            recommendation: "Raise an explicit exception instead of assert in non-test code."
+                .into(),
+        };
+        let without_header = format_human_output(&[finding], false);
+        assert!(!without_header.contains("colint diagnostics"));
+
+        let with_header = format_human_output(&[], true);
+        assert!(with_header.starts_with("colint diagnostics\n"));
+        assert!(with_header.contains("# noqa"));
+        assert!(with_header.contains("# colint: ignore[COL-003,COL-010]"));
+        assert!(with_header.contains("# NOTE: reason"));
+        assert!(!with_header.contains(r"\n"));
+    }
+
+    #[test]
     fn reports_core_rules_and_honors_line_suppressions() {
         let source = r#"
 def source() -> str:
@@ -1146,6 +1422,7 @@ def ignored():
             warnings_as_errors: false,
             rules: HashMap::from([("COL-010".to_string(), false)]),
             docstring_convention: default_docstring_convention(),
+            col002_skip_private_definitions: default_col002_skip_private_definitions(),
             import_paths: Vec::new(),
         };
         let normal = analyze(
@@ -1178,11 +1455,108 @@ def ignored():
     }
 
     #[test]
+    fn lofting_messages_name_parameters_and_inferred_targets() {
+        let one = findings(
+            "def run(thing):\n    value = thing.get_value()\n    use(value)\n",
+            "app.py",
+        );
+        assert_eq!(
+            one.iter()
+                .find(|finding| finding.code == "COL-002")
+                .unwrap()
+                .message,
+            "parameter `thing` is only queried once; loft its queried value to `use`"
+        );
+
+        let many = findings(
+            "def run(left, right):\n    consume(left.value(), right.value())\n",
+            "app.py",
+        );
+        assert_eq!(
+            many.iter().find(|finding| finding.code == "COL-002").unwrap().message,
+            "parameters `left` and `right` are only queried once; loft their queried values to `consume`"
+        );
+
+        let unknown = findings("def run(thing):\n    thing.get_value()\n", "app.py");
+        assert_eq!(
+            unknown
+                .iter()
+                .find(|finding| finding.code == "COL-002")
+                .unwrap()
+                .message,
+            "parameter `thing` is only queried once; loft its queried value into the caller"
+        );
+    }
+
+    #[test]
+    fn col002_skips_private_definitions_by_default_and_can_be_enabled() {
+        let source = r#"
+def public(thing):
+    thing.value()
+
+def _private(thing):
+    thing.value()
+
+class _PrivateClass:
+    def public_method(self, thing):
+        thing.value()
+
+class PublicClass:
+    def _private_method(self, thing):
+        thing.value()
+"#;
+        let default_findings = findings(source, "app.py");
+        assert_eq!(
+            default_findings
+                .iter()
+                .filter(|finding| finding.code == "COL-002")
+                .count(),
+            1
+        );
+
+        let config = Config {
+            col002_skip_private_definitions: false,
+            ..Config::default()
+        };
+        assert_eq!(
+            analyze(Path::new("app.py"), source, &config, false)
+                .iter()
+                .filter(|finding| finding.code == "COL-002")
+                .count(),
+            4
+        );
+        assert!(
+            toml::from_str::<Config>("")
+                .unwrap()
+                .col002_skip_private_definitions
+        );
+    }
+
+    #[test]
     fn nested_import_requires_note_but_accepts_multiline_note() {
         let bad = codes("def run():\n    import os\n", "app.py");
         let good = codes("def run():\n    # NOTE: platform-dependent import\n    # kept local to avoid startup cost\n    import os\n", "app.py");
         assert!(bad.contains(&"COL-003".to_string()));
         assert!(!good.contains(&"COL-003".to_string()));
+    }
+
+    #[test]
+    fn nested_import_notes_cover_groups_and_multiline_import_styles() {
+        let fixture = include_str!("../imports_example.py");
+        assert!(!codes(fixture, "imports_example.py").contains(&"COL-003".to_string()));
+
+        let source = r#"
+def run():
+    # NOTE: optional dependencies stay local.
+    from package import (
+        alpha,
+        beta,
+    )
+
+    from other_package import gamma, \\
+        delta
+"#;
+        assert!(!codes(source, "app.py").contains(&"COL-003".to_string()));
     }
 
     #[test]
@@ -1252,6 +1626,32 @@ def ignored():
         );
         assert!(missing.contains(&"COL-013".to_string()));
         assert!(empty.contains(&"COL-013".to_string()));
+    }
+
+    #[test]
+    fn custom_widget_definitions_are_not_instances_but_instances_need_tooltips() {
+        let fixture = include_str!("../tests/fixtures/tip.txt");
+        let fixture_findings = findings(fixture, "tip.txt");
+        let fixture_codes = fixture_findings
+            .iter()
+            .map(|finding| format!("{}:{}: {}", finding.code, finding.line, finding.message))
+            .collect::<Vec<_>>();
+        assert!(
+            !fixture_findings
+                .iter()
+                .any(|finding| finding.code == "COL-013"),
+            "unexpected findings: {fixture_codes:?}"
+        );
+
+        let missing = r#"
+class CustomWidget(QtWidgets.QWidget):
+    def __init__(self):
+        self.label = QtWidgets.QLabel()
+        self.label.setToolTip("Label")
+
+widget = CustomWidget()
+"#;
+        assert!(codes(missing, "app.py").contains(&"COL-013".to_string()));
     }
 
     #[test]
@@ -1382,6 +1782,7 @@ class Window:
             warnings_as_errors: false,
             rules: HashMap::from([("COL-001".to_string(), false)]),
             docstring_convention: default_docstring_convention(),
+            col002_skip_private_definitions: default_col002_skip_private_definitions(),
             import_paths: Vec::new(),
         };
         let source = "def run(value):\n    if not value:\n        return\n    work()\n";
@@ -1399,6 +1800,7 @@ class Window:
             warnings_as_errors: false,
             rules: HashMap::new(),
             docstring_convention: "google".to_string(),
+            col002_skip_private_definitions: default_col002_skip_private_definitions(),
             import_paths: Vec::new(),
         };
         let source = "def create(task):\n    \"\"\"Create *task*.\"\"\"\n";
