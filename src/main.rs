@@ -92,6 +92,9 @@ struct Config {
     /// The markup used when referring to parameters in docstrings.
     #[serde(default = "default_docstring_convention")]
     docstring_convention: String,
+    /// Whether COL-002 skips underscore-prefixed functions, methods, and classes.
+    #[serde(default = "default_col002_skip_private_definitions")]
+    col002_skip_private_definitions: bool,
     /// Extra package roots used when resolving imported base classes. Paths in
     /// `.colint.toml` are relative to that file unless already absolute.
     #[serde(default)]
@@ -100,12 +103,16 @@ struct Config {
 fn default_docstring_convention() -> String {
     "mkdocs".into()
 }
+fn default_col002_skip_private_definitions() -> bool {
+    true
+}
 impl Default for Config {
     fn default() -> Self {
         Self {
             warnings_as_errors: false,
             rules: HashMap::new(),
             docstring_convention: default_docstring_convention(),
+            col002_skip_private_definitions: default_col002_skip_private_definitions(),
             import_paths: Vec::new(),
         }
     }
@@ -585,7 +592,9 @@ fn check_function(
     let t = text(n, src);
     let body = n.child_by_field_name("body");
     check_empty_string_returns(out, path, src, n, cfg, strict);
-    check_lofting(out, path, src, n, cfg, strict);
+    if !cfg.col002_skip_private_definitions || !is_private_definition(n, src) {
+        check_lofting(out, path, src, n, cfg, strict);
+    }
     check_docstring_markup(out, path, src, n, &cfg.docstring_convention, cfg, strict);
     if let Some(b) = body {
         let first = b.named_child(0);
@@ -620,6 +629,29 @@ fn check_function(
             );
         }
     }
+}
+
+/// A definition is private when its own name starts with `_`, or when it is a
+/// method of a class whose name starts with `_`. This includes dunder members.
+fn is_private_definition(function: Node, src: &str) -> bool {
+    if function
+        .child_by_field_name("name")
+        .is_some_and(|name| text(name, src).starts_with('_'))
+    {
+        return true;
+    }
+    let mut parent = function.parent();
+    while let Some(node) = parent {
+        if node.kind() == "class_definition"
+            && node
+                .child_by_field_name("name")
+                .is_some_and(|name| text(name, src).starts_with('_'))
+        {
+            return true;
+        }
+        parent = node.parent();
+    }
+    false
 }
 
 fn contains_direct_kind(node: Node, kind: &str) -> bool {
@@ -1317,6 +1349,7 @@ def ignored():
             warnings_as_errors: false,
             rules: HashMap::from([("COL-010".to_string(), false)]),
             docstring_convention: default_docstring_convention(),
+            col002_skip_private_definitions: default_col002_skip_private_definitions(),
             import_paths: Vec::new(),
         };
         let normal = analyze(
@@ -1379,6 +1412,50 @@ def ignored():
                 .unwrap()
                 .message,
             "parameter `thing` is only queried once; loft its queried value into the caller"
+        );
+    }
+
+    #[test]
+    fn col002_skips_private_definitions_by_default_and_can_be_enabled() {
+        let source = r#"
+def public(thing):
+    thing.value()
+
+def _private(thing):
+    thing.value()
+
+class _PrivateClass:
+    def public_method(self, thing):
+        thing.value()
+
+class PublicClass:
+    def _private_method(self, thing):
+        thing.value()
+"#;
+        let default_findings = findings(source, "app.py");
+        assert_eq!(
+            default_findings
+                .iter()
+                .filter(|finding| finding.code == "COL-002")
+                .count(),
+            1
+        );
+
+        let config = Config {
+            col002_skip_private_definitions: false,
+            ..Config::default()
+        };
+        assert_eq!(
+            analyze(Path::new("app.py"), source, &config, false)
+                .iter()
+                .filter(|finding| finding.code == "COL-002")
+                .count(),
+            4
+        );
+        assert!(
+            toml::from_str::<Config>("")
+                .unwrap()
+                .col002_skip_private_definitions
         );
     }
 
@@ -1606,6 +1683,7 @@ class Window:
             warnings_as_errors: false,
             rules: HashMap::from([("COL-001".to_string(), false)]),
             docstring_convention: default_docstring_convention(),
+            col002_skip_private_definitions: default_col002_skip_private_definitions(),
             import_paths: Vec::new(),
         };
         let source = "def run(value):\n    if not value:\n        return\n    work()\n";
@@ -1623,6 +1701,7 @@ class Window:
             warnings_as_errors: false,
             rules: HashMap::new(),
             docstring_convention: "google".to_string(),
+            col002_skip_private_definitions: default_col002_skip_private_definitions(),
             import_paths: Vec::new(),
         };
         let source = "def create(task):\n    \"\"\"Create *task*.\"\"\"\n";
