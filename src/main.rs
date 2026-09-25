@@ -1,6 +1,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use clap::Parser;
+use regex::Regex;
 use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet},
@@ -846,6 +847,7 @@ fn check_lofting(
         return;
     };
     let body_text = text(body, src);
+    let mut candidates = Vec::new();
     let mut cursor = parameters.walk();
     for parameter in parameters.named_children(&mut cursor) {
         let parameter_text = text(parameter, src);
@@ -853,13 +855,88 @@ fn check_lofting(
         if name.is_empty() || name == "self" || name == "cls" {
             continue;
         }
-        let uses: Vec<_> = body_text.match_indices(name).collect();
-        if uses.len() == 1 {
-            let suffix = &body_text[uses[0].0 + name.len()..];
-            if suffix.trim_start().starts_with('.') {
-                add(out, path, src, function, "COL-002", "parameter is only queried once; consider lofting the queried value into the caller", cfg, strict);
-            }
+        let query = Regex::new(&format!(r"\b{}\.[A-Za-z_]\w*\s*\(", regex::escape(name)))
+            .expect("escaped parameter name is a valid regex");
+        if query.find_iter(body_text).count() == 1
+            && Regex::new(&format!(r"\b{}\b", regex::escape(name)))
+                .expect("escaped parameter name is a valid regex")
+                .find_iter(body_text)
+                .count()
+                == 1
+        {
+            candidates.push((name.to_string(), lofting_target(body_text, name)));
         }
+    }
+    if candidates.is_empty() {
+        return;
+    }
+    let names = candidates
+        .iter()
+        .map(|(name, _)| format!("`{name}`"))
+        .collect::<Vec<_>>();
+    let parameters = join_human(&names);
+    let targets = candidates
+        .iter()
+        .filter_map(|(_, target)| target.as_deref())
+        .collect::<HashSet<_>>();
+    let singular = candidates.len() == 1;
+    let message = if targets.len() == 1 && candidates.iter().all(|(_, target)| target.is_some()) {
+        format!(
+            "{} {} {} only queried once; loft {} queried {} to `{}`",
+            if singular { "parameter" } else { "parameters" },
+            parameters,
+            if singular { "is" } else { "are" },
+            if singular { "its" } else { "their" },
+            if singular { "value" } else { "values" },
+            targets.into_iter().next().expect("one target"),
+        )
+    } else {
+        format!(
+            "{} {} {} only queried once; loft {} queried {} into the caller",
+            if singular { "parameter" } else { "parameters" },
+            parameters,
+            if singular { "is" } else { "are" },
+            if singular { "its" } else { "their" },
+            if singular { "value" } else { "values" },
+        )
+    };
+    add(out, path, src, function, "COL-002", &message, cfg, strict);
+}
+
+fn lofting_target(body: &str, parameter: &str) -> Option<String> {
+    let escaped = regex::escape(parameter);
+    let direct = Regex::new(&format!(r"\b([A-Za-z_]\w*)\s*\(\s*{}\.", escaped))
+        .expect("escaped parameter name is a valid regex");
+    if let Some(captures) = direct.captures(body) {
+        return captures.get(1).map(|target| target.as_str().to_string());
+    }
+    let assigned = Regex::new(&format!(
+        r"\b([A-Za-z_]\w*)\s*=\s*{}\.[A-Za-z_]\w*\s*\(",
+        escaped
+    ))
+    .expect("escaped parameter name is a valid regex");
+    let value = assigned.captures(body)?.get(1)?.as_str();
+    let consumer = Regex::new(&format!(
+        r"\b([A-Za-z_]\w*)\s*\(\s*{}\b",
+        regex::escape(value)
+    ))
+    .expect("captured local name is a valid regex");
+    consumer
+        .captures(body)
+        .and_then(|captures| captures.get(1))
+        .map(|target| target.as_str().to_string())
+}
+
+fn join_human(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [item] => item.clone(),
+        [first, second] => format!("{first} and {second}"),
+        _ => format!(
+            "{}, and {}",
+            items[..items.len() - 1].join(", "),
+            items.last().unwrap()
+        ),
     }
 }
 
@@ -1269,6 +1346,40 @@ def ignored():
             "app.py"
         )
         .contains(&"COL-002".to_string()));
+    }
+
+    #[test]
+    fn lofting_messages_name_parameters_and_inferred_targets() {
+        let one = findings(
+            "def run(thing):\n    value = thing.get_value()\n    use(value)\n",
+            "app.py",
+        );
+        assert_eq!(
+            one.iter()
+                .find(|finding| finding.code == "COL-002")
+                .unwrap()
+                .message,
+            "parameter `thing` is only queried once; loft its queried value to `use`"
+        );
+
+        let many = findings(
+            "def run(left, right):\n    consume(left.value(), right.value())\n",
+            "app.py",
+        );
+        assert_eq!(
+            many.iter().find(|finding| finding.code == "COL-002").unwrap().message,
+            "parameters `left` and `right` only queried once; loft their queried values to `consume`"
+        );
+
+        let unknown = findings("def run(thing):\n    thing.get_value()\n", "app.py");
+        assert_eq!(
+            unknown
+                .iter()
+                .find(|finding| finding.code == "COL-002")
+                .unwrap()
+                .message,
+            "parameter `thing` is only queried once; loft its queried value into the caller"
+        );
     }
 
     #[test]
