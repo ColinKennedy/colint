@@ -905,8 +905,11 @@ fn check_lofting(
 
 fn lofting_target(body: &str, parameter: &str) -> Option<String> {
     let escaped = regex::escape(parameter);
-    let direct = Regex::new(&format!(r"\b([A-Za-z_]\w*)\s*\(\s*{}\.", escaped))
-        .expect("escaped parameter name is a valid regex");
+    let direct = Regex::new(&format!(
+        r"\b([A-Za-z_]\w*)\s*\([^\n]*\b{}\.",
+        escaped
+    ))
+    .expect("escaped parameter name is a valid regex");
     if let Some(captures) = direct.captures(body) {
         return captures.get(1).map(|target| target.as_str().to_string());
     }
@@ -1368,7 +1371,7 @@ def ignored():
         );
         assert_eq!(
             many.iter().find(|finding| finding.code == "COL-002").unwrap().message,
-            "parameters `left` and `right` only queried once; loft their queried values to `consume`"
+            "parameters `left` and `right` are only queried once; loft their queried values to `consume`"
         );
 
         let unknown = findings("def run(thing):\n    thing.get_value()\n", "app.py");
