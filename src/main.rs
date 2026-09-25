@@ -1630,7 +1630,7 @@ def run():
 
     #[test]
     fn custom_widget_definitions_are_not_instances_but_instances_need_tooltips() {
-        let fixture = include_str!("../tip.txt");
+        let fixture = include_str!("../tests/fixtures/tip.txt");
         let fixture_findings = findings(fixture, "tip.txt");
         let fixture_codes = fixture_findings
             .iter()
