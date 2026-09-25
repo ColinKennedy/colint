@@ -152,25 +152,29 @@ fn main() -> ExitCode {
         println!("{}", serde_json::to_string_pretty(&findings).unwrap());
     } else {
         for f in &findings {
-            println!(
-                "{}:{}:{}: {} - {} [{}]\\n  recommendation: {}",
-                f.path,
-                f.line,
-                f.column,
-                f.code,
-                f.message,
-                match f.severity {
-                    Severity::Warning => "warning",
-                    Severity::Error => "error",
-                },
-                f.recommendation
-            );
+            println!("{}", format_human_finding(f));
         }
     }
     ExitCode::from(exit_status(
         &findings,
         config.warnings_as_errors || cli.strict,
     ))
+}
+
+fn format_human_finding(finding: &Finding) -> String {
+    format!(
+        "{}:{}:{}: {} - {} [{}]\n  recommendation: {}",
+        finding.path,
+        finding.line,
+        finding.column,
+        finding.code,
+        finding.message,
+        match finding.severity {
+            Severity::Warning => "warning",
+            Severity::Error => "error",
+        },
+        finding.recommendation
+    )
 }
 
 fn exit_status(findings: &[Finding], warnings_as_errors: bool) -> u8 {
@@ -1106,6 +1110,25 @@ mod tests {
             local_return_types(parser.parse(src, None).unwrap().root_node(), src).get("value"),
             Some(&"list[str]".to_string())
         );
+    }
+
+    #[test]
+    fn human_findings_use_real_newlines() {
+        let finding = Finding {
+            path: "app.py".into(),
+            line: 2,
+            column: 5,
+            code: "COL-010".into(),
+            name: "assert-in-production".into(),
+            severity: Severity::Error,
+            message: "assert is used outside test code".into(),
+            recommendation: "Raise an explicit exception instead of assert in non-test code."
+                .into(),
+        };
+        let rendered = format_human_finding(&finding);
+        assert!(rendered.contains('\n'));
+        assert!(!rendered.contains(r"\n"));
+        assert_eq!(rendered.lines().count(), 2);
     }
 
     #[test]
