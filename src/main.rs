@@ -430,7 +430,8 @@ fn add(
 }
 
 fn nested_import_has_note(n: Node, src: &str) -> bool {
-    let before = &src[..n.start_byte()];
+    let first_in_group = first_import_in_group(n);
+    let before = &src[..first_in_group.start_byte()];
     let mut meaningful = before.lines().rev().filter(|l| !l.trim().is_empty());
     match meaningful.next() {
         Some(line) if line.trim_start().starts_with('#') => {
@@ -448,6 +449,33 @@ fn nested_import_has_note(n: Node, src: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// Returns the first consecutive nested import in this block. Comments and
+/// whitespace are not named syntax nodes, so they naturally do not split a
+/// group; multiline imports remain one Tree-sitter statement.
+fn first_import_in_group(n: Node) -> Node {
+    let Some(parent) = n.parent() else {
+        return n;
+    };
+    let mut imports = Vec::new();
+    let mut cursor = parent.walk();
+    for child in parent.named_children(&mut cursor) {
+        if child.end_byte() <= n.start_byte() {
+            imports.push(child);
+        } else {
+            break;
+        }
+    }
+    let mut first = n;
+    for child in imports.into_iter().rev() {
+        if matches!(child.kind(), "import_statement" | "import_from_statement") {
+            first = child;
+        } else {
+            break;
+        }
+    }
+    first
 }
 fn local_return_types(root: Node, src: &str) -> HashMap<String, String> {
     let mut x = HashMap::new();
@@ -1249,6 +1277,25 @@ def ignored():
         let good = codes("def run():\n    # NOTE: platform-dependent import\n    # kept local to avoid startup cost\n    import os\n", "app.py");
         assert!(bad.contains(&"COL-003".to_string()));
         assert!(!good.contains(&"COL-003".to_string()));
+    }
+
+    #[test]
+    fn nested_import_notes_cover_groups_and_multiline_import_styles() {
+        let fixture = include_str!("../imports_example.py");
+        assert!(!codes(fixture, "imports_example.py").contains(&"COL-003".to_string()));
+
+        let source = r#"
+def run():
+    # NOTE: optional dependencies stay local.
+    from package import (
+        alpha,
+        beta,
+    )
+
+    from other_package import gamma, \\
+        delta
+"#;
+        assert!(!codes(source, "app.py").contains(&"COL-003".to_string()));
     }
 
     #[test]
