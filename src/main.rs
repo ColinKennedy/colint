@@ -75,6 +75,9 @@ struct Cli {
     /// Emit machine-readable diagnostics
     #[arg(long)]
     json: bool,
+    /// Prepend guidance for reading and suppressing diagnostics
+    #[arg(long)]
+    include_header: bool,
     /// Use this configuration file instead of discovering .colint.toml
     #[arg(long)]
     config: Option<PathBuf>,
@@ -151,9 +154,7 @@ fn main() -> ExitCode {
     if cli.json {
         println!("{}", serde_json::to_string_pretty(&findings).unwrap());
     } else {
-        for f in &findings {
-            println!("{}", format_human_finding(f));
-        }
+        print!("{}", format_human_output(&findings, cli.include_header));
     }
     ExitCode::from(exit_status(
         &findings,
@@ -175,6 +176,24 @@ fn format_human_finding(finding: &Finding) -> String {
         },
         finding.recommendation
     )
+}
+
+const HUMAN_OUTPUT_HEADER: &str = "colint diagnostics\n\
+Suppress a finding on its line with `# noqa`, or selected codes with\n\
+`# colint: ignore[COL-003,COL-010]`. For COL-003 nested imports, use\n\
+`# NOTE: reason` immediately above one import or an import group; blank lines\n\
+do not end that group.\n\n";
+
+fn format_human_output(findings: &[Finding], include_header: bool) -> String {
+    let mut output = String::new();
+    if include_header {
+        output.push_str(HUMAN_OUTPUT_HEADER);
+    }
+    for finding in findings {
+        output.push_str(&format_human_finding(finding));
+        output.push('\n');
+    }
+    output
 }
 
 fn exit_status(findings: &[Finding], warnings_as_errors: bool) -> u8 {
@@ -1129,6 +1148,30 @@ mod tests {
         assert!(rendered.contains('\n'));
         assert!(!rendered.contains(r"\n"));
         assert_eq!(rendered.lines().count(), 2);
+    }
+
+    #[test]
+    fn human_output_header_is_opt_in() {
+        let finding = Finding {
+            path: "app.py".into(),
+            line: 1,
+            column: 1,
+            code: "COL-010".into(),
+            name: "assert-in-production".into(),
+            severity: Severity::Error,
+            message: "assert is used outside test code".into(),
+            recommendation: "Raise an explicit exception instead of assert in non-test code."
+                .into(),
+        };
+        let without_header = format_human_output(&[finding], false);
+        assert!(!without_header.contains("colint diagnostics"));
+
+        let with_header = format_human_output(&[], true);
+        assert!(with_header.starts_with("colint diagnostics\n"));
+        assert!(with_header.contains("# noqa"));
+        assert!(with_header.contains("# colint: ignore[COL-003,COL-010]"));
+        assert!(with_header.contains("# NOTE: reason"));
+        assert!(!with_header.contains(r"\n"));
     }
 
     #[test]
