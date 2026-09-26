@@ -15,8 +15,9 @@ colint --help
 
 ## Release
 
-1. Update the matching versions in `Cargo.toml` and `pyproject.toml`.
+1. Update the version in `Cargo.toml`. Maturin uses that single source for the
+   Python distribution version.
 2. Run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test --all-targets`.
 3. Create and push a matching annotated tag, for example `git tag -a v0.1.0 -m "v0.1.0"; git push origin v0.1.0`.
 
-Pushing a `v*` tag builds platform wheels and an sdist, creates a GitHub Release with those artifacts attached, then publishes the assembled artifacts through PyPI trusted publishing.
+Pushing a `v*` tag builds platform wheels and an sdist, creates a GitHub Release with those artifacts attached, then publishes the assembled artifacts through PyPI trusted publishing. The workflow rejects a tag whose version does not match `Cargo.toml`, before building or publishing any artifacts.

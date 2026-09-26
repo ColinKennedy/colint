@@ -25,6 +25,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Verify tag matches package version
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          package_version="$(cargo metadata --no-deps --format-version=1 | python3 -c 'import json, sys; print(next(package["version"] for package in json.load(sys.stdin)["packages"] if package["name"] == "colint"))')"
+          test "$tag_version" = "$package_version" || {
+            echo "Tag v$tag_version does not match Cargo.toml version $package_version"
+            exit 1
+          }
       - uses: PyO3/maturin-action@v1
         with:
           command: build
