@@ -7,4 +7,4 @@ docstring_convention = "mkdocs"
 
 # Set any rule to false to disable it. --strict overrides these choices.
 [rules]
-# COL-003 = false
+# STY-001 = false
