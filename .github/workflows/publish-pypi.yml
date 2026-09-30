@@ -2,15 +2,69 @@ name: Release and publish to PyPI
 
 on:
   push:
-    tags: ["v*"]
+    branches: [master]
+
+concurrency:
+  group: release-master
+  cancel-in-progress: false
 
 permissions:
   contents: write
   id-token: write
 
 jobs:
+  prepare:
+    name: Create next minor version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: version
+        name: Bump the package version and tag it
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --force --tags origin
+          latest_tag="$(git tag --list 'v*' --sort=-version:refname | head -n1)"
+          if [[ -z "$latest_tag" ]]; then
+            next_version="0.1.0"
+          else
+            IFS=. read -r major minor patch <<< "${latest_tag#v}"
+            next_version="$major.$((minor + 1)).0"
+          fi
+
+          python3 - "$next_version" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          version = sys.argv[1]
+          patterns = {
+              "Cargo.toml": r'(?m)^(version = )"[^"]+"$',
+              "Cargo.lock": r'(?m)(\[\[package\]\]\nname = "colint"\nversion = )"[^"]+"$',
+          }
+          for filename, pattern in patterns.items():
+              path = Path(filename)
+              updated, count = re.subn(pattern, rf'\g<1>"{version}"', path.read_text())
+              if count != 1:
+                  raise SystemExit(f"Could not update the package version in {filename}")
+              path.write_text(updated)
+          PY
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "Release v$next_version"
+          git tag -a "v$next_version" -m "Release v$next_version"
+          git push origin HEAD:master --follow-tags
+          echo "tag=v$next_version" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build ${{ matrix.os }} artifact
+    needs: prepare
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -24,16 +78,9 @@ jobs:
             args: --release --out dist --compatibility pypi
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
-      - name: Verify tag matches package version
-        shell: bash
-        run: |
-          tag_version="${GITHUB_REF_NAME#v}"
-          package_version="$(cargo metadata --no-deps --format-version=1 | python3 -c 'import json, sys; print(next(package["version"] for package in json.load(sys.stdin)["packages"] if package["name"] == "colint"))')"
-          test "$tag_version" = "$package_version" || {
-            echo "Tag v$tag_version does not match Cargo.toml version $package_version"
-            exit 1
-          }
       - uses: PyO3/maturin-action@v1
         with:
           command: build
@@ -45,7 +92,7 @@ jobs:
 
   release:
     name: Create GitHub release
-    needs: build
+    needs: [prepare, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -55,6 +102,7 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
           generate_release_notes: true
           files: dist/*
 
