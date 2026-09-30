@@ -22,6 +22,9 @@ classifiers = [
     "Topic :: Software Development :: Quality Assurance",
 ]
 
+[project.urls]
+Source = "https://github.com/ColinKennedy/colint"
+
 [tool.maturin]
 # Package the Rust executable as the `colint` command in wheels.
 bindings = "bin"

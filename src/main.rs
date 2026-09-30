@@ -13,20 +13,24 @@ use tree_sitter::{Node, Parser as TsParser};
 use walkdir::{DirEntry, WalkDir};
 
 const RULES: &[Rule] = &[
-    Rule::new("COL-001", "predicate-in-function", Severity::Warning, "Move the predicate to the caller so this function always performs work."),
-    Rule::new("COL-002", "loft-from-caller", Severity::Warning, "Pass the queried value instead of the complex object when the object is not otherwise used."),
-    Rule::new("COL-003", "nested-import", Severity::Error, "Move the import to module scope, or add an immediately preceding NOTE comment explaining why it is nested."),
-    Rule::new("COL-004", "docstring-convention", Severity::Warning, "Use the configured docstring markup for parameters mentioned in the summary."),
-    Rule::new("COL-005", "redundant-type-hint", Severity::Error, "Remove the redundant local annotation; the locally defined callee already provides its return type."),
-    Rule::new("COL-006", "pytest-expected-left", Severity::Warning, "Put the expected value on the left side of a pytest equality assertion."),
-    Rule::new("COL-007", "logging-dynamic-quote", Severity::Warning, "Wrap a logging placeholder in quotes, for example `message \"%s\"`."),
-    Rule::new("COL-008", "module-order", Severity::Warning, "Keep module declarations ordered as globals, classes, then functions."),
-    Rule::new("COL-009", "empty-string-return", Severity::Error, "Return None for a not-found result and include None in the return annotation."),
-    Rule::new("COL-010", "assert-in-production", Severity::Error, "Raise an explicit exception instead of assert in non-test code."),
-    Rule::new("COL-011", "none-polymorphism", Severity::Warning, "Prefer a polymorphic truthiness check (`if value:`) for a Foo | None value."),
-    Rule::new("COL-012", "direct-raises-only", Severity::Error, "Document Raises only for exceptions raised directly by this function."),
-    Rule::new("COL-013", "widget-tooltip", Severity::Warning, "Set a non-empty static tooltip, or add a comment explaining why no tooltip is appropriate."),
-    Rule::new("COL-014", "qt-model-parent", Severity::Error, "Construct Qt models and proxies with a parent; subclasses should forward parent to super().__init__()."),
+    // API — function design and correctness
+    Rule::new("API-001", "predicate-in-function", Severity::Warning, "Move the predicate to the caller so this function always performs work."),
+    Rule::new("API-002", "loft-from-caller", Severity::Warning, "Pass the queried value instead of the complex object when the object is not otherwise used."),
+    Rule::new("API-003", "redundant-type-hint", Severity::Error, "Remove the redundant local annotation; the locally defined callee already provides its return type."),
+    Rule::new("API-004", "empty-string-return", Severity::Error, "Return None for a not-found result and include None in the return annotation."),
+    Rule::new("API-005", "assert-in-production", Severity::Error, "Raise an explicit exception instead of assert in non-test code."),
+    Rule::new("API-006", "none-polymorphism", Severity::Warning, "Prefer a polymorphic truthiness check (`if value:`) for a Foo | None value."),
+    // DOC — documentation
+    Rule::new("DOC-001", "docstring-convention", Severity::Warning, "Use the configured docstring markup for parameters mentioned in the summary."),
+    Rule::new("DOC-002", "direct-raises-only", Severity::Error, "Document Raises only for exceptions raised directly by this function."),
+    // STY — style and organization
+    Rule::new("STY-001", "nested-import", Severity::Error, "Move the import to module scope, or add an immediately preceding NOTE comment explaining why it is nested."),
+    Rule::new("STY-002", "pytest-expected-left", Severity::Warning, "Put the expected value on the left side of a pytest equality assertion."),
+    Rule::new("STY-003", "logging-dynamic-quote", Severity::Warning, "Wrap a logging placeholder in quotes, for example `message \"%s\"`."),
+    Rule::new("STY-004", "module-order", Severity::Warning, "Keep module declarations ordered as globals, classes, then functions."),
+    // GUI — Qt/PySide widgets
+    Rule::new("GUI-001", "widget-tooltip", Severity::Warning, "Set a non-empty static tooltip, or add a comment explaining why no tooltip is appropriate."),
+    Rule::new("GUI-002", "qt-model-parent", Severity::Error, "Construct Qt models and proxies with a parent; subclasses should forward parent to super().__init__()."),
 ];
 
 #[derive(Clone, Copy, Serialize, PartialEq, Eq)]
@@ -92,9 +96,9 @@ struct Config {
     /// The markup used when referring to parameters in docstrings.
     #[serde(default = "default_docstring_convention")]
     docstring_convention: String,
-    /// Whether COL-002 skips underscore-prefixed functions, methods, and classes.
-    #[serde(default = "default_col002_skip_private_definitions")]
-    col002_skip_private_definitions: bool,
+    /// Whether API-002 skips underscore-prefixed functions, methods, and classes.
+    #[serde(default = "default_api002_skip_private_definitions")]
+    api002_skip_private_definitions: bool,
     /// Extra package roots used when resolving imported base classes. Paths in
     /// `.colint.toml` are relative to that file unless already absolute.
     #[serde(default)]
@@ -103,7 +107,7 @@ struct Config {
 fn default_docstring_convention() -> String {
     "mkdocs".into()
 }
-fn default_col002_skip_private_definitions() -> bool {
+fn default_api002_skip_private_definitions() -> bool {
     true
 }
 impl Default for Config {
@@ -112,7 +116,7 @@ impl Default for Config {
             warnings_as_errors: false,
             rules: HashMap::new(),
             docstring_convention: default_docstring_convention(),
-            col002_skip_private_definitions: default_col002_skip_private_definitions(),
+            api002_skip_private_definitions: default_api002_skip_private_definitions(),
             import_paths: Vec::new(),
         }
     }
@@ -187,8 +191,9 @@ fn format_human_finding(finding: &Finding) -> String {
 }
 
 const HUMAN_OUTPUT_HEADER: &str = "colint diagnostics\n\
-Suppress a finding on its line with `# noqa`, or selected codes with\n\
-`# colint: ignore[COL-003,COL-010]`. For COL-003 nested imports, use\n\
+Suppress a finding on its line with `# noqa`, or selected codes or rule\n\
+names with `# colint: ignore[STY-001,API-005]` or\n\
+`# colint: ignore[nested-import]`. For STY-001 nested imports, use\n\
 `# NOTE: reason` immediately above one import or an import group; blank lines\n\
 do not end that group.\n\n";
 
@@ -338,7 +343,7 @@ fn analyze_with_qt_model_classes(
                     path,
                     src,
                     n,
-                    "COL-003",
+                    "STY-001",
                     "nested import requires a preceding NOTE comment",
                     config,
                     strict,
@@ -350,7 +355,7 @@ fn analyze_with_qt_model_classes(
             path,
             src,
             n,
-            "COL-010",
+            "API-005",
             "assert is used outside test code",
             config,
             strict,
@@ -441,7 +446,7 @@ fn check_custom_widget_instance(
             path,
             src,
             assignment,
-            "COL-013",
+            "GUI-001",
             "widget has no static tooltip on every construction path",
             cfg,
             strict,
@@ -478,10 +483,16 @@ fn suppressed(node: Node, src: &str, code: &str) -> bool {
     if line.contains("# noqa") {
         return true;
     }
+    let name = rule(code).name;
     line.find("# colint: ignore[")
         .and_then(|i| line[i..].split_once('['))
         .and_then(|(_, rest)| rest.split_once(']'))
-        .is_some_and(|(codes, _)| codes.split(',').any(|c| c.trim() == code))
+        .is_some_and(|(codes, _)| {
+            codes.split(',').any(|c| {
+                let c = c.trim();
+                c == code || c == name
+            })
+        })
 }
 fn add(
     out: &mut Vec<Finding>,
@@ -593,7 +604,7 @@ fn check_assignment(
                     path,
                     src,
                     n,
-                    "COL-005",
+                    "API-003",
                     "local annotation duplicates the direct callee return type",
                     cfg,
                     strict,
@@ -616,7 +627,7 @@ fn check_call(out: &mut Vec<Finding>, path: &Path, src: &str, n: Node, cfg: &Con
             path,
             src,
             n,
-            "COL-007",
+            "STY-003",
             "logging placeholder is not quoted",
             cfg,
             strict,
@@ -630,7 +641,7 @@ fn check_call(out: &mut Vec<Finding>, path: &Path, src: &str, n: Node, cfg: &Con
             path,
             src,
             n,
-            "COL-014",
+            "GUI-002",
             "Qt model or proxy is constructed without a parent",
             cfg,
             strict,
@@ -647,7 +658,7 @@ fn check_call(out: &mut Vec<Finding>, path: &Path, src: &str, n: Node, cfg: &Con
             path,
             src,
             n,
-            "COL-013",
+            "GUI-001",
             "tooltip may be empty",
             cfg,
             strict,
@@ -665,7 +676,7 @@ fn check_function(
     let t = text(n, src);
     let body = n.child_by_field_name("body");
     check_empty_string_returns(out, path, src, n, cfg, strict);
-    if !cfg.col002_skip_private_definitions || !is_private_definition(n, src) {
+    if !cfg.api002_skip_private_definitions || !is_private_definition(n, src) {
         check_lofting(out, path, src, n, cfg, strict);
     }
     check_docstring_markup(out, path, src, n, &cfg.docstring_convention, cfg, strict);
@@ -679,7 +690,7 @@ fn check_function(
                     path,
                     src,
                     first.unwrap(),
-                    "COL-001",
+                    "API-001",
                     "function immediately returns based on a predicate",
                     cfg,
                     strict,
@@ -695,7 +706,7 @@ fn check_function(
                 path,
                 src,
                 n,
-                "COL-012",
+                "DOC-002",
                 "docstring documents Raises but this function has no direct raise",
                 cfg,
                 strict,
@@ -770,7 +781,7 @@ fn check_qt_model_subclass(
             path,
             src,
             class,
-            "COL-014",
+            "GUI-002",
             "Qt model subclass initializer must accept parent and forward it to super().__init__()",
             cfg,
             strict,
@@ -900,7 +911,7 @@ fn check_none_comparison(
             path,
             src,
             n,
-            "COL-011",
+            "API-006",
             "consider a polymorphic truthiness check instead of `is not None`",
             cfg,
             strict,
@@ -932,7 +943,7 @@ fn check_empty_string_returns(
             } else {
                 "empty string is returned; use `return None` and add `None` to this function's return annotation"
             };
-            add(out, path, src, node, "COL-009", message, cfg, strict);
+            add(out, path, src, node, "API-004", message, cfg, strict);
         }
     });
 }
@@ -1005,7 +1016,7 @@ fn check_lofting(
             if singular { "value" } else { "values" },
         )
     };
-    add(out, path, src, function, "COL-002", &message, cfg, strict);
+    add(out, path, src, function, "API-002", &message, cfg, strict);
 }
 
 fn lofting_target(body: &str, parameter: &str) -> Option<String> {
@@ -1079,7 +1090,7 @@ fn check_docstring_markup(
                 path,
                 src,
                 first,
-                "COL-004",
+                "DOC-001",
                 "MkDocs parameter references use backticks, not asterisks",
                 cfg,
                 strict,
@@ -1120,7 +1131,7 @@ fn check_pytest_assertion(
             path,
             src,
             assertion,
-            "COL-006",
+            "STY-002",
             "pytest equality has the actual value on the left",
             cfg,
             strict,
@@ -1157,7 +1168,7 @@ fn check_widget_tooltips(
                 path,
                 src,
                 function,
-                "COL-013",
+                "GUI-001",
                 "widget has no static tooltip on every construction path",
                 cfg,
                 strict,
@@ -1237,7 +1248,7 @@ fn check_class_widget_tooltips(
                 path,
                 src,
                 init,
-                "COL-013",
+                "GUI-001",
                 "widget has no static tooltip on every construction path",
                 cfg,
                 strict,
@@ -1303,7 +1314,7 @@ fn check_module_order(
                 path,
                 src,
                 n,
-                "COL-008",
+                "STY-004",
                 "module declaration appears after a class or function",
                 cfg,
                 strict,
@@ -1347,7 +1358,7 @@ mod tests {
             path: "app.py".into(),
             line: 2,
             column: 5,
-            code: "COL-010".into(),
+            code: "API-005".into(),
             name: "assert-in-production".into(),
             severity: Severity::Error,
             message: "assert is used outside test code".into(),
@@ -1366,7 +1377,7 @@ mod tests {
             path: "app.py".into(),
             line: 1,
             column: 1,
-            code: "COL-010".into(),
+            code: "API-005".into(),
             name: "assert-in-production".into(),
             severity: Severity::Error,
             message: "assert is used outside test code".into(),
@@ -1379,7 +1390,7 @@ mod tests {
         let with_header = format_human_output(&[], true);
         assert!(with_header.starts_with("colint diagnostics\n"));
         assert!(with_header.contains("# noqa"));
-        assert!(with_header.contains("# colint: ignore[COL-003,COL-010]"));
+        assert!(with_header.contains("# colint: ignore[STY-001,API-005]"));
         assert!(with_header.contains("# NOTE: reason"));
         assert!(!with_header.contains(r"\n"));
     }
@@ -1397,14 +1408,14 @@ def consumer():
     return ""
 
 def ignored():
-    import sys  # colint: ignore[COL-003]
+    import sys  # colint: ignore[STY-001]
 "#;
         let codes = codes(source, "production.py");
-        assert!(codes.contains(&"COL-003".to_string()));
-        assert!(codes.contains(&"COL-005".to_string()));
-        assert!(codes.contains(&"COL-009".to_string()));
-        assert!(codes.contains(&"COL-010".to_string()));
-        assert_eq!(codes.iter().filter(|code| *code == "COL-003").count(), 1);
+        assert!(codes.contains(&"STY-001".to_string()));
+        assert!(codes.contains(&"API-003".to_string()));
+        assert!(codes.contains(&"API-004".to_string()));
+        assert!(codes.contains(&"API-005".to_string()));
+        assert_eq!(codes.iter().filter(|code| *code == "STY-001").count(), 1);
     }
 
     #[test]
@@ -1413,16 +1424,16 @@ def ignored():
             "def test_value():\n    assert actual == [\"expected\"]\n",
             "test_value.py",
         );
-        assert!(codes.contains(&"COL-006".to_string()));
+        assert!(codes.contains(&"STY-002".to_string()));
     }
 
     #[test]
     fn configuration_can_disable_a_rule_unless_strict() {
         let config = Config {
             warnings_as_errors: false,
-            rules: HashMap::from([("COL-010".to_string(), false)]),
+            rules: HashMap::from([("API-005".to_string(), false)]),
             docstring_convention: default_docstring_convention(),
-            col002_skip_private_definitions: default_col002_skip_private_definitions(),
+            api002_skip_private_definitions: default_api002_skip_private_definitions(),
             import_paths: Vec::new(),
         };
         let normal = analyze(
@@ -1433,7 +1444,7 @@ def ignored():
         );
         let strict = analyze(Path::new("production.py"), "assert active\n", &config, true);
         assert!(normal.is_empty());
-        assert!(strict.iter().any(|finding| finding.code == "COL-010"));
+        assert!(strict.iter().any(|finding| finding.code == "API-005"));
     }
 
     #[test]
@@ -1442,7 +1453,7 @@ def ignored():
             "def run(value):\n    if not value:\n        return\n    work()\n",
             "app.py"
         )
-        .contains(&"COL-001".to_string()));
+        .contains(&"API-001".to_string()));
     }
 
     #[test]
@@ -1451,7 +1462,7 @@ def ignored():
             "def run(thing):\n    value = thing.get_value()\n    use(value)\n",
             "app.py"
         )
-        .contains(&"COL-002".to_string()));
+        .contains(&"API-002".to_string()));
     }
 
     #[test]
@@ -1462,7 +1473,7 @@ def ignored():
         );
         assert_eq!(
             one.iter()
-                .find(|finding| finding.code == "COL-002")
+                .find(|finding| finding.code == "API-002")
                 .unwrap()
                 .message,
             "parameter `thing` is only queried once; loft its queried value to `use`"
@@ -1473,7 +1484,7 @@ def ignored():
             "app.py",
         );
         assert_eq!(
-            many.iter().find(|finding| finding.code == "COL-002").unwrap().message,
+            many.iter().find(|finding| finding.code == "API-002").unwrap().message,
             "parameters `left` and `right` are only queried once; loft their queried values to `consume`"
         );
 
@@ -1481,7 +1492,7 @@ def ignored():
         assert_eq!(
             unknown
                 .iter()
-                .find(|finding| finding.code == "COL-002")
+                .find(|finding| finding.code == "API-002")
                 .unwrap()
                 .message,
             "parameter `thing` is only queried once; loft its queried value into the caller"
@@ -1489,7 +1500,7 @@ def ignored():
     }
 
     #[test]
-    fn col002_skips_private_definitions_by_default_and_can_be_enabled() {
+    fn api002_skips_private_definitions_by_default_and_can_be_enabled() {
         let source = r#"
 def public(thing):
     thing.value()
@@ -1509,26 +1520,26 @@ class PublicClass:
         assert_eq!(
             default_findings
                 .iter()
-                .filter(|finding| finding.code == "COL-002")
+                .filter(|finding| finding.code == "API-002")
                 .count(),
             1
         );
 
         let config = Config {
-            col002_skip_private_definitions: false,
+            api002_skip_private_definitions: false,
             ..Config::default()
         };
         assert_eq!(
             analyze(Path::new("app.py"), source, &config, false)
                 .iter()
-                .filter(|finding| finding.code == "COL-002")
+                .filter(|finding| finding.code == "API-002")
                 .count(),
             4
         );
         assert!(
             toml::from_str::<Config>("")
                 .unwrap()
-                .col002_skip_private_definitions
+                .api002_skip_private_definitions
         );
     }
 
@@ -1536,14 +1547,14 @@ class PublicClass:
     fn nested_import_requires_note_but_accepts_multiline_note() {
         let bad = codes("def run():\n    import os\n", "app.py");
         let good = codes("def run():\n    # NOTE: platform-dependent import\n    # kept local to avoid startup cost\n    import os\n", "app.py");
-        assert!(bad.contains(&"COL-003".to_string()));
-        assert!(!good.contains(&"COL-003".to_string()));
+        assert!(bad.contains(&"STY-001".to_string()));
+        assert!(!good.contains(&"STY-001".to_string()));
     }
 
     #[test]
     fn nested_import_notes_cover_groups_and_multiline_import_styles() {
         let fixture = include_str!("../imports_example.py");
-        assert!(!codes(fixture, "imports_example.py").contains(&"COL-003".to_string()));
+        assert!(!codes(fixture, "imports_example.py").contains(&"STY-001".to_string()));
 
         let source = r#"
 def run():
@@ -1556,7 +1567,7 @@ def run():
     from other_package import gamma, \\
         delta
 "#;
-        assert!(!codes(source, "app.py").contains(&"COL-003".to_string()));
+        assert!(!codes(source, "app.py").contains(&"STY-001".to_string()));
     }
 
     #[test]
@@ -1565,33 +1576,33 @@ def run():
             "def create(task):\n    \"\"\"Create *task*.\"\"\"\n",
             "app.py"
         )
-        .contains(&"COL-004".to_string()));
+        .contains(&"DOC-001".to_string()));
     }
 
     #[test]
     fn quoted_logging_placeholder_is_allowed() {
         let bad = codes("logger.error('Could not load %s', name)\n", "app.py");
         let good = codes("logger.error('Could not load \"%s\"', name)\n", "app.py");
-        assert!(bad.contains(&"COL-007".to_string()));
-        assert!(!good.contains(&"COL-007".to_string()));
+        assert!(bad.contains(&"STY-003".to_string()));
+        assert!(!good.contains(&"STY-003".to_string()));
     }
 
     #[test]
     fn module_assignment_after_function_is_reported() {
         assert!(codes("def make():\n    pass\n\nVALUE = 1\n", "app.py")
-            .contains(&"COL-008".to_string()));
+            .contains(&"STY-004".to_string()));
     }
 
     #[test]
     fn empty_return_requires_none() {
         assert!(codes("def find() -> str | int:\n    return ''\n", "app.py")
-            .contains(&"COL-009".to_string()));
+            .contains(&"API-004".to_string()));
     }
 
     #[test]
     fn asserts_are_allowed_in_test_files_only() {
-        assert!(codes("assert ready\n", "app.py").contains(&"COL-010".to_string()));
-        assert!(!codes("assert ready\n", "test_app.py").contains(&"COL-010".to_string()));
+        assert!(codes("assert ready\n", "app.py").contains(&"API-005".to_string()));
+        assert!(!codes("assert ready\n", "test_app.py").contains(&"API-005".to_string()));
     }
 
     #[test]
@@ -1600,18 +1611,18 @@ def run():
             "def run(value: Thing | None):\n    if value is not None:\n        use(value)\n",
             "app.py"
         )
-        .contains(&"COL-011".to_string()));
+        .contains(&"API-006".to_string()));
         assert!(!codes(
             "def run(value: Thing):\n    if value is not None:\n        use(value)\n",
             "app.py"
         )
-        .contains(&"COL-011".to_string()));
+        .contains(&"API-006".to_string()));
     }
 
     #[test]
     fn indirect_raises_documentation_is_reported() {
-        assert!(codes("def run():\n    \"\"\"Run.\n\n    Raises:\n        ValueError: When broken.\n    \"\"\"\n    dependency()\n", "app.py").contains(&"COL-012".to_string()));
-        assert!(!codes("def run():\n    \"\"\"Run.\n\n    Raises:\n        ValueError: When broken.\n    \"\"\"\n    raise ValueError()\n", "app.py").contains(&"COL-012".to_string()));
+        assert!(codes("def run():\n    \"\"\"Run.\n\n    Raises:\n        ValueError: When broken.\n    \"\"\"\n    dependency()\n", "app.py").contains(&"DOC-002".to_string()));
+        assert!(!codes("def run():\n    \"\"\"Run.\n\n    Raises:\n        ValueError: When broken.\n    \"\"\"\n    raise ValueError()\n", "app.py").contains(&"DOC-002".to_string()));
     }
 
     #[test]
@@ -1624,8 +1635,8 @@ def run():
             "def build(self):\n    self.button = QPushButton()\n    self.button.setToolTip(\"\")\n",
             "app.py",
         );
-        assert!(missing.contains(&"COL-013".to_string()));
-        assert!(empty.contains(&"COL-013".to_string()));
+        assert!(missing.contains(&"GUI-001".to_string()));
+        assert!(empty.contains(&"GUI-001".to_string()));
     }
 
     #[test]
@@ -1639,7 +1650,7 @@ def run():
         assert!(
             !fixture_findings
                 .iter()
-                .any(|finding| finding.code == "COL-013"),
+                .any(|finding| finding.code == "GUI-001"),
             "unexpected findings: {fixture_codes:?}"
         );
 
@@ -1651,7 +1662,7 @@ class CustomWidget(QtWidgets.QWidget):
 
 widget = CustomWidget()
 "#;
-        assert!(codes(missing, "app.py").contains(&"COL-013".to_string()));
+        assert!(codes(missing, "app.py").contains(&"GUI-001".to_string()));
     }
 
     #[test]
@@ -1668,7 +1679,7 @@ class Window:
     def _set_button_tooltip(self):
         self.button.setToolTip("Open the selected item")
 "#;
-        assert!(!codes(source, "app.py").contains(&"COL-013".to_string()));
+        assert!(!codes(source, "app.py").contains(&"GUI-001".to_string()));
     }
 
     #[test]
@@ -1686,7 +1697,7 @@ class Window:
         self._configure()
         self.button.setToolTip("Open the selected item")
 "#;
-        assert!(!codes(source, "app.py").contains(&"COL-013".to_string()));
+        assert!(!codes(source, "app.py").contains(&"GUI-001".to_string()));
     }
 
     #[test]
@@ -1699,15 +1710,15 @@ class Window:
     def _set_button_tooltip(self):
         self.button.setToolTip("Open the selected item")
 "#;
-        assert!(codes(source, "app.py").contains(&"COL-013".to_string()));
+        assert!(codes(source, "app.py").contains(&"GUI-001".to_string()));
     }
 
     #[test]
     fn qt_model_parent_is_required_for_construction() {
         let bad = codes("model = QStandardItemModel()\n", "app.py");
         let good = codes("model = QStandardItemModel(parent=parent)\n", "app.py");
-        assert!(bad.contains(&"COL-014".to_string()));
-        assert!(!good.contains(&"COL-014".to_string()));
+        assert!(bad.contains(&"GUI-002".to_string()));
+        assert!(!good.contains(&"GUI-002".to_string()));
     }
 
     #[test]
@@ -1732,7 +1743,7 @@ class Window:
             false,
             &known,
         );
-        assert!(findings.iter().any(|finding| finding.code == "COL-014"));
+        assert!(findings.iter().any(|finding| finding.code == "GUI-002"));
     }
 
     #[test]
@@ -1757,41 +1768,55 @@ class Window:
             false,
             &known,
         );
-        assert!(findings.iter().any(|finding| finding.code == "COL-014"));
+        assert!(findings.iter().any(|finding| finding.code == "GUI-002"));
     }
 
     #[test]
     fn noqa_and_selected_suppressions_do_not_overreach() {
         assert!(codes(
-            "def run():\n    import os  # colint: ignore[COL-010]\n",
+            "def run():\n    import os  # colint: ignore[API-005]\n",
             "app.py"
         )
-        .contains(&"COL-003".to_string()));
-        assert!(!codes("assert value  # noqa\n", "app.py").contains(&"COL-010".to_string()));
+        .contains(&"STY-001".to_string()));
+        assert!(!codes("assert value  # noqa\n", "app.py").contains(&"API-005".to_string()));
+    }
+
+    #[test]
+    fn ignore_accepts_rule_names_alongside_codes() {
+        assert!(!codes(
+            "def run():\n    import os  # colint: ignore[nested-import]\n",
+            "app.py"
+        )
+        .contains(&"STY-001".to_string()));
+        assert!(!codes(
+            "def run():\n    import os  # colint: ignore[nested-import,API-005]\n",
+            "app.py"
+        )
+        .contains(&"STY-001".to_string()));
     }
 
     #[test]
     fn nested_function_raises_do_not_justify_outer_raises_docstring() {
         let source = "def outer():\n    \"\"\"Outer.\n\n    Raises:\n        ValueError: Never directly raised.\n    \"\"\"\n    def inner():\n        raise ValueError()\n";
-        assert!(codes(source, "app.py").contains(&"COL-012".to_string()));
+        assert!(codes(source, "app.py").contains(&"DOC-002".to_string()));
     }
 
     #[test]
     fn strict_reenables_disabled_warning_rules() {
         let config = Config {
             warnings_as_errors: false,
-            rules: HashMap::from([("COL-001".to_string(), false)]),
+            rules: HashMap::from([("API-001".to_string(), false)]),
             docstring_convention: default_docstring_convention(),
-            col002_skip_private_definitions: default_col002_skip_private_definitions(),
+            api002_skip_private_definitions: default_api002_skip_private_definitions(),
             import_paths: Vec::new(),
         };
         let source = "def run(value):\n    if not value:\n        return\n    work()\n";
         assert!(!analyze(Path::new("app.py"), source, &config, false)
             .iter()
-            .any(|finding| finding.code == "COL-001"));
+            .any(|finding| finding.code == "API-001"));
         assert!(analyze(Path::new("app.py"), source, &config, true)
             .iter()
-            .any(|finding| finding.code == "COL-001"));
+            .any(|finding| finding.code == "API-001"));
     }
 
     #[test]
@@ -1800,13 +1825,13 @@ class Window:
             warnings_as_errors: false,
             rules: HashMap::new(),
             docstring_convention: "google".to_string(),
-            col002_skip_private_definitions: default_col002_skip_private_definitions(),
+            api002_skip_private_definitions: default_api002_skip_private_definitions(),
             import_paths: Vec::new(),
         };
         let source = "def create(task):\n    \"\"\"Create *task*.\"\"\"\n";
         assert!(!analyze(Path::new("app.py"), source, &config, false)
             .iter()
-            .any(|finding| finding.code == "COL-004"));
+            .any(|finding| finding.code == "DOC-001"));
     }
 
     #[test]
@@ -1826,7 +1851,7 @@ class Window:
     fn multiline_calls_and_import_groups_preserve_diagnostics() {
         let source = "def run():\n    import os\n    import sys\n\nlogger.error(\n    'Failed for %s',\n    value,\n)\n";
         let codes = codes(source, "app.py");
-        assert_eq!(codes.iter().filter(|code| *code == "COL-003").count(), 2);
-        assert!(codes.contains(&"COL-007".to_string()));
+        assert_eq!(codes.iter().filter(|code| *code == "STY-001").count(), 2);
+        assert!(codes.contains(&"STY-003".to_string()));
     }
 }
