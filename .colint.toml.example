@@ -1,9 +1,11 @@
 # Warnings remain successful unless this is true.
 warnings_as_errors = false
 
-# Currently supported: "mkdocs". In MkDocs docstrings, parameters are written
-# as `parameter`, not *parameter*.
-docstring_convention = "mkdocs"
+# DOC-001: the markup expected around parameter names in docstrings. Wrapped
+# names such as *bar*, "bar", or ``bar`` are reported; bare names are ignored.
+[docstring_variable_markup]
+start = "`"
+end = "`"
 
 # Set any rule to false to disable it. --strict overrides these choices.
 [rules]
