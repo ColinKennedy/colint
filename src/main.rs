@@ -12,6 +12,15 @@ use std::{
 use tree_sitter::{Node, Parser as TsParser};
 use walkdir::{DirEntry, WalkDir};
 
+/// A regex compiled once, on first use.
+macro_rules! static_regex {
+    ($pattern:expr) => {{
+        static REGEX: std::sync::LazyLock<Regex> =
+            std::sync::LazyLock::new(|| Regex::new($pattern).expect("valid regex"));
+        &*REGEX
+    }};
+}
+
 const RULES: &[Rule] = &[
     // API — function design and correctness
     Rule::new("API-001", "predicate-in-function", Severity::Warning, "Move the predicate to the caller so this function always performs work."),
@@ -329,389 +338,1090 @@ fn analyze_with_qt_model_classes(
         Some(t) => t,
         None => return vec![],
     };
-    let mut out = Vec::new();
     let root = tree.root_node();
-    let defined_returns = local_return_types(root, src);
-    let custom_widget_classes = custom_widget_classes(root, src);
+    let mut lint = Linter {
+        path,
+        src,
+        cfg: config,
+        strict,
+        is_test: is_test_path(path),
+        out: Vec::new(),
+    };
+    let functions = local_return_types(root, src);
+    let methods = local_method_return_types(root, src);
+    let widget_classes = custom_widget_classes(root, src);
+    let class_bases = local_class_bases(root, src);
     walk(root, &mut |n| match n.kind() {
-        "import_statement" | "import_from_statement"
-            if n.parent().is_some_and(|p| p.kind() != "module") =>
+        "import_statement" | "import_from_statement" => lint.check_nested_import(n),
+        "assert_statement" => {
+            lint.check_assert(n);
+            lint.check_pytest_assertion(n);
+        }
+        "assignment" => {
+            lint.check_redundant_annotation(n, &functions, &methods);
+            lint.check_widget_assignment(n, &widget_classes);
+        }
+        "call" => {
+            lint.check_logging_call(n);
+            lint.check_model_construction(n, qt_model_classes);
+            lint.check_empty_tooltip(n);
+        }
+        "function_definition" => lint.check_function(n, &class_bases),
+        "class_definition" => lint.check_qt_model_subclass(n, qt_model_classes),
+        "if_statement" => lint.check_none_comparison(n),
+        _ => {}
+    });
+    lint.check_module_order(root);
+    lint.out
+}
+
+/// Per-file state shared by every check.
+struct Linter<'a> {
+    path: &'a Path,
+    src: &'a str,
+    cfg: &'a Config,
+    strict: bool,
+    is_test: bool,
+    out: Vec<Finding>,
+}
+
+impl<'a> Linter<'a> {
+    fn text(&self, node: Node) -> &'a str {
+        text(node, self.src)
+    }
+
+    fn report(&mut self, node: Node, code: &str, message: &str) {
+        if !enabled(code, self.cfg, self.strict) || suppressed(node, self.src, code) {
+            return;
+        }
+        let r = rule(code);
+        let p = node.start_position();
+        self.out.push(Finding {
+            path: self.path.display().to_string(),
+            line: p.row + 1,
+            column: p.column + 1,
+            code: code.into(),
+            name: r.name.into(),
+            severity: r.severity,
+            message: message.into(),
+            recommendation: r.recommendation.into(),
+        });
+    }
+
+    fn check_function(&mut self, function: Node, class_bases: &HashMap<String, Vec<String>>) {
+        self.check_predicate_guard(function);
+        self.check_lofting(function);
+        self.check_empty_string_returns(function);
+        self.check_docstring_markup(function);
+        self.check_raises_documentation(function, class_bases);
+    }
+
+    // API-001 -------------------------------------------------------------
+
+    /// Reports a function whose first statement (after any docstring) is an
+    /// `if` with no `elif`/`else` whose only body statement is a `return`.
+    fn check_predicate_guard(&mut self, function: Node) {
+        let Some(body) = function.child_by_field_name("body") else {
+            return;
+        };
+        let statements = code_children(body);
+        let skip = usize::from(docstring(function).is_some());
+        let Some(&statement) = statements.get(skip) else {
+            return;
+        };
+        if statement.kind() != "if_statement"
+            || statement.child_by_field_name("alternative").is_some()
         {
-            if !nested_import_has_note(n, src) {
-                add(
-                    &mut out,
-                    path,
-                    src,
-                    n,
-                    "STY-001",
-                    "nested import requires a preceding NOTE comment",
-                    config,
-                    strict,
+            return;
+        }
+        let Some(consequence) = statement.child_by_field_name("consequence") else {
+            return;
+        };
+        let guarded = code_children(consequence);
+        if let [only] = guarded.as_slice() {
+            if only.kind() == "return_statement" {
+                self.report(
+                    statement,
+                    "API-001",
+                    "function immediately returns based on a predicate",
                 );
             }
         }
-        "assert_statement" if !path.to_string_lossy().contains("test") => add(
-            &mut out,
-            path,
-            src,
-            n,
-            "API-005",
-            "assert is used outside test code",
-            config,
-            strict,
-        ),
-        "assignment" => {
-            check_assignment(&mut out, path, src, n, &defined_returns, config, strict);
-            check_custom_widget_instance(
-                &mut out,
-                path,
-                src,
-                n,
-                &custom_widget_classes,
-                config,
-                strict,
-            );
-        }
-        "call" => {
-            check_call(&mut out, path, src, n, config, strict);
-        }
-        "function_definition" => {
-            check_function(&mut out, path, src, n, config, strict);
-            if !is_inside_class(n) {
-                check_widget_tooltips(&mut out, path, src, n, config, strict);
-            }
-        }
-        "class_definition" => {
-            check_qt_model_subclass(&mut out, path, src, n, qt_model_classes, config, strict);
-            check_class_widget_tooltips(&mut out, path, src, n, config, strict);
-        }
-        "assert_statement" => check_pytest_assertion(&mut out, path, src, n, config, strict),
-        "if_statement" => check_none_comparison(&mut out, path, src, n, config, strict),
-        _ => {}
-    });
-    check_module_order(&mut out, path, src, root, config, strict);
-    out
-}
+    }
 
-fn custom_widget_classes(root: Node, src: &str) -> HashSet<String> {
-    let mut classes = HashSet::new();
-    walk(root, &mut |node| {
-        if node.kind() != "class_definition" {
+    // API-002 -------------------------------------------------------------
+
+    fn check_lofting(&mut self, function: Node) {
+        if self.cfg.api002_skip_private_definitions && is_private_definition(function, self.src) {
             return;
         }
-        let (Some(name), Some(superclasses)) = (
-            node.child_by_field_name("name"),
-            node.child_by_field_name("superclasses"),
+        if has_decorator(function, self.src, "override") {
+            return;
+        }
+        let Some(parameters) = function.child_by_field_name("parameters") else {
+            return;
+        };
+        let Some(body) = function.child_by_field_name("body") else {
+            return;
+        };
+        let mut candidates = Vec::new();
+        for parameter in code_children(parameters) {
+            let Some((name, splat)) = parameter_name(parameter, self.src) else {
+                continue;
+            };
+            if splat || name == "self" || name == "cls" {
+                continue;
+            }
+            let uses = references(body, name, self.src);
+            let [only] = uses.as_slice() else {
+                continue;
+            };
+            let Some(query) = query_call(*only) else {
+                continue;
+            };
+            candidates.push((name.to_string(), lofting_target(query, body, self.src)));
+        }
+        if candidates.is_empty() {
+            return;
+        }
+        let names = candidates
+            .iter()
+            .map(|(name, _)| format!("`{name}`"))
+            .collect::<Vec<_>>();
+        let parameters = join_human(&names);
+        let targets = candidates
+            .iter()
+            .filter_map(|(_, target)| target.as_deref())
+            .collect::<HashSet<_>>();
+        let singular = candidates.len() == 1;
+        let destination =
+            if targets.len() == 1 && candidates.iter().all(|(_, target)| target.is_some()) {
+                format!("to `{}`", targets.into_iter().next().expect("one target"))
+            } else {
+                "into the caller".to_string()
+            };
+        let message = format!(
+            "{} {} {} only queried once; loft {} queried {} {}",
+            if singular { "parameter" } else { "parameters" },
+            parameters,
+            if singular { "is" } else { "are" },
+            if singular { "its" } else { "their" },
+            if singular { "value" } else { "values" },
+            destination,
+        );
+        self.report(function, "API-002", &message);
+    }
+
+    // API-003 -------------------------------------------------------------
+
+    fn check_redundant_annotation(
+        &mut self,
+        assignment: Node,
+        functions: &HashMap<String, String>,
+        methods: &HashMap<String, String>,
+    ) {
+        let (Some(annotation), Some(right)) = (
+            assignment.child_by_field_name("type"),
+            assignment.child_by_field_name("right"),
         ) else {
             return;
         };
-        if text(superclasses, src).contains("Widget") {
-            classes.insert(text(name, src).to_string());
+        let mut value = unparen(right);
+        if value.kind() == "await" {
+            let Some(&awaited) = code_children(value).first() else {
+                return;
+            };
+            value = unparen(awaited);
         }
-    });
-    classes
-}
+        if value.kind() != "call" {
+            return;
+        }
+        let Some(callee) = value.child_by_field_name("function") else {
+            return;
+        };
+        let declared = match callee.kind() {
+            "identifier" => functions.get(self.text(callee)),
+            "attribute" => {
+                let object = callee.child_by_field_name("object");
+                let attribute = callee.child_by_field_name("attribute");
+                match (object, attribute) {
+                    (Some(object), Some(attribute))
+                        if matches!(self.text(object), "self" | "cls") =>
+                    {
+                        methods.get(self.text(attribute))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if declared.is_some_and(|declared| {
+            normalize_annotation(declared) == normalize_annotation(self.text(annotation))
+        }) {
+            self.report(
+                assignment,
+                "API-003",
+                "local annotation duplicates the direct callee return type",
+            );
+        }
+    }
 
-fn check_custom_widget_instance(
-    out: &mut Vec<Finding>,
-    path: &Path,
-    src: &str,
-    assignment: Node,
-    custom_widget_classes: &HashSet<String>,
-    cfg: &Config,
-    strict: bool,
-) {
-    let Some((left, right)) = text(assignment, src).split_once('=') else {
-        return;
-    };
-    let instance = left.trim().trim_start_matches("self.");
-    let constructor = right.trim().split('(').next().unwrap_or("").trim();
-    if instance.is_empty() || !custom_widget_classes.contains(constructor) {
-        return;
-    }
-    let mut scope = assignment;
-    while let Some(parent) = scope.parent() {
-        scope = parent;
-        if matches!(
-            scope.kind(),
-            "module" | "function_definition" | "class_definition"
-        ) {
-            break;
+    // API-004 -------------------------------------------------------------
+
+    fn check_empty_string_returns(&mut self, function: Node) {
+        let Some(body) = function.child_by_field_name("body") else {
+            return;
+        };
+        let allows_none = function
+            .child_by_field_name("return_type")
+            .map_or(true, |annotation| {
+                annotation_allows_none(self.text(annotation))
+            });
+        let message = if allows_none {
+            "empty string is returned; use `return None`"
+        } else {
+            "empty string is returned; use `return None` and add `None` to this function's return annotation"
+        };
+        let mut returns = Vec::new();
+        walk_scope(body, &mut |node| {
+            if node.kind() == "return_statement"
+                && code_children(node)
+                    .first()
+                    .is_some_and(|value| is_empty_string(*value, self.src))
+            {
+                returns.push(node);
+            }
+        });
+        for node in returns {
+            self.report(node, "API-004", message);
         }
     }
-    let scope = text(scope, src);
-    if !scope.contains(&format!("{instance}.setToolTip(")) && !scope.contains("no tooltip") {
-        add(
-            out,
-            path,
-            src,
-            assignment,
-            "GUI-001",
-            "widget has no static tooltip on every construction path",
-            cfg,
-            strict,
+
+    // API-005 -------------------------------------------------------------
+
+    fn check_assert(&mut self, assertion: Node) {
+        if !self.is_test {
+            self.report(assertion, "API-005", "assert is used outside test code");
+        }
+    }
+
+    // API-006 -------------------------------------------------------------
+
+    /// Inspects only the `if`/`elif` conditions, so a comparison is reported
+    /// once at its own location rather than for every enclosing `if`.
+    fn check_none_comparison(&mut self, if_statement: Node) {
+        let Some(function) = enclosing_function(if_statement) else {
+            return;
+        };
+        let optional = optional_names(function, self.src);
+        if optional.is_empty() {
+            return;
+        }
+        let mut conditions = Vec::from_iter(if_statement.child_by_field_name("condition"));
+        let mut cursor = if_statement.walk();
+        for alternative in if_statement.children_by_field_name("alternative", &mut cursor) {
+            if alternative.kind() == "elif_clause" {
+                conditions.extend(alternative.child_by_field_name("condition"));
+            }
+        }
+        let mut comparisons = Vec::new();
+        for condition in conditions {
+            walk(condition, &mut |node| {
+                if node.kind() != "comparison_operator" {
+                    return;
+                }
+                let operands = code_children(node);
+                let [left, right] = operands.as_slice() else {
+                    return;
+                };
+                let operator = comparison_operator(node, self.src);
+                if operator != "is" && operator != "is not" {
+                    return;
+                }
+                let (left, right) = (unparen(*left), unparen(*right));
+                let name = match (left.kind(), right.kind()) {
+                    ("identifier", "none") => left,
+                    ("none", "identifier") => right,
+                    _ => return,
+                };
+                if optional.contains(self.text(name)) {
+                    comparisons.push(node);
+                }
+            });
+        }
+        for comparison in comparisons {
+            let message = format!(
+                "consider a polymorphic truthiness check instead of `{}`",
+                collapse_whitespace(self.text(comparison))
+            );
+            self.report(comparison, "API-006", &message);
+        }
+    }
+
+    // DOC-001 -------------------------------------------------------------
+
+    fn check_docstring_markup(&mut self, function: Node) {
+        if !self.cfg.docstring_convention.eq_ignore_ascii_case("mkdocs") {
+            return;
+        }
+        let Some(parameters) = function.child_by_field_name("parameters") else {
+            return;
+        };
+        let Some(docstring) = docstring(function) else {
+            return;
+        };
+        let emphasized = emphasized_words(self.text(docstring));
+        for parameter in code_children(parameters) {
+            let Some((name, _)) = parameter_name(parameter, self.src) else {
+                continue;
+            };
+            if emphasized.contains(name) {
+                self.report(
+                    function,
+                    "DOC-001",
+                    &format!(
+                        "MkDocs parameter references use backticks, not asterisks: write `{name}`"
+                    ),
+                );
+                break;
+            }
+        }
+    }
+
+    // DOC-002 -------------------------------------------------------------
+
+    fn check_raises_documentation(
+        &mut self,
+        function: Node,
+        class_bases: &HashMap<String, Vec<String>>,
+    ) {
+        let Some(docstring) = docstring(function) else {
+            return;
+        };
+        let Some(documented) = documented_raises(self.text(docstring)) else {
+            return;
+        };
+        let Some(body) = function.child_by_field_name("body") else {
+            return;
+        };
+        let raised = direct_raises(body, self.src);
+        if !raised.any {
+            self.report(
+                function,
+                "DOC-002",
+                "docstring documents Raises but this function has no direct raise",
+            );
+            return;
+        }
+        if raised.unknown {
+            return;
+        }
+        let indirect = documented
+            .iter()
+            .filter(|documented| {
+                !raised
+                    .names
+                    .iter()
+                    .any(|raised| is_same_or_subclass(raised, documented, class_bases))
+            })
+            .map(|name| format!("`{name}`"))
+            .collect::<Vec<_>>();
+        if !indirect.is_empty() {
+            let message = format!(
+                "docstring documents {} in Raises but this function does not raise {} directly",
+                join_human(&indirect),
+                if indirect.len() == 1 { "it" } else { "them" },
+            );
+            self.report(function, "DOC-002", &message);
+        }
+    }
+
+    // STY-001 -------------------------------------------------------------
+
+    /// Only imports inside a function or class are nested. Module-level
+    /// conditional imports (`if TYPE_CHECKING:`, `try: ... except ImportError:`)
+    /// are still evaluated once at import time and are not reported.
+    fn check_nested_import(&mut self, import: Node) {
+        if enclosing_definition(import).is_none() || nested_import_has_note(import, self.src) {
+            return;
+        }
+        self.report(
+            import,
+            "STY-001",
+            "nested import requires a preceding NOTE comment",
         );
     }
+
+    // STY-002 -------------------------------------------------------------
+
+    fn check_pytest_assertion(&mut self, assertion: Node) {
+        if !self.is_test {
+            return;
+        }
+        let Some(condition) = code_children(assertion).first().map(|n| unparen(*n)) else {
+            return;
+        };
+        if condition.kind() != "comparison_operator" {
+            return;
+        }
+        let operands = code_children(condition);
+        let [left, right] = operands.as_slice() else {
+            return;
+        };
+        if comparison_operator(condition, self.src) != "==" {
+            return;
+        }
+        if !is_literal(*left) && is_literal(*right) {
+            self.report(
+                assertion,
+                "STY-002",
+                "pytest equality has the actual value on the left",
+            );
+        }
+    }
+
+    // STY-003 -------------------------------------------------------------
+
+    fn check_logging_call(&mut self, call: Node) {
+        let Some(message) = logging_message_argument(call, self.src) else {
+            return;
+        };
+        let mut strings = Vec::new();
+        match message.kind() {
+            "string" => strings.push(message),
+            "concatenated_string" => strings.extend(code_children(message)),
+            _ => return,
+        }
+        let unquoted = strings
+            .into_iter()
+            .filter_map(|string| string_body(string, self.src))
+            .any(has_unquoted_placeholder);
+        if unquoted {
+            self.report(call, "STY-003", "logging placeholder is not quoted");
+        }
+    }
+
+    // STY-004 -------------------------------------------------------------
+
+    fn check_module_order(&mut self, root: Node) {
+        let mut stage = 0;
+        for node in code_children(root) {
+            let definition = if node.kind() == "decorated_definition" {
+                node.child_by_field_name("definition").unwrap_or(node)
+            } else {
+                node
+            };
+            let next = match definition.kind() {
+                "class_definition" => 1,
+                "function_definition" => 2,
+                _ if is_main_guard(node, self.src) => continue,
+                _ => 0,
+            };
+            if next < stage {
+                let message = if next == 0 {
+                    "module declaration appears after a class or function"
+                } else {
+                    "class appears after a function"
+                };
+                self.report(node, "STY-004", message);
+            }
+            stage = stage.max(next);
+        }
+    }
+
+    // GUI-001 -------------------------------------------------------------
+
+    /// Reports a widget constructed and bound to a name when no
+    /// `name.setToolTip(...)` call is reachable from the construction scope.
+    /// Inside a class, the scope is every method reachable through `self.`
+    /// calls from the constructing method or from any method that reaches it.
+    fn check_widget_assignment(&mut self, assignment: Node, widget_classes: &HashSet<String>) {
+        let (Some(left), Some(right)) = (
+            assignment.child_by_field_name("left"),
+            assignment.child_by_field_name("right"),
+        ) else {
+            return;
+        };
+        if !matches!(left.kind(), "identifier" | "attribute") {
+            return;
+        }
+        let call = unparen(right);
+        if call.kind() != "call" {
+            return;
+        }
+        let Some(constructor) = call
+            .child_by_field_name("function")
+            .and_then(|function| last_segment(function, self.src))
+        else {
+            return;
+        };
+        if !is_widget_class(constructor, widget_classes) {
+            return;
+        }
+        if keyword_argument(call, "toolTip", self.src)
+            .is_some_and(|value| !is_empty_string(value, self.src) && value.kind() != "none")
+        {
+            return;
+        }
+        let target: String = self
+            .text(left)
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let name = target.strip_prefix("self.").unwrap_or(&target);
+        let scope = tooltip_scope(assignment, self.src);
+        let tooltip = Regex::new(&format!(
+            r"(?:^|[^\w.]|\bself\s*\.\s*){}\s*\.\s*setToolTip\s*\(",
+            regex::escape(name).replace(r"\.", r"\s*\.\s*")
+        ))
+        .expect("escaped widget name is a valid regex");
+        let exempt = static_regex!(r"(?im)#[^\n]*\bno tooltip\b");
+        if !scope
+            .iter()
+            .any(|s| tooltip.is_match(s) || exempt.is_match(s))
+        {
+            let message =
+                format!("widget `{target}` has no static tooltip on every construction path");
+            self.report(assignment, "GUI-001", &message);
+        }
+    }
+
+    fn check_empty_tooltip(&mut self, call: Node) {
+        let Some(function) = call.child_by_field_name("function") else {
+            return;
+        };
+        if function.kind() != "attribute"
+            || function
+                .child_by_field_name("attribute")
+                .map_or(true, |attribute| self.text(attribute) != "setToolTip")
+        {
+            return;
+        }
+        let Some(arguments) = call.child_by_field_name("arguments") else {
+            return;
+        };
+        let Some(value) = code_children(arguments).first().map(|n| unparen(*n)) else {
+            return;
+        };
+        let empty = is_empty_string(value, self.src)
+            || (value.kind() == "boolean_operator"
+                && value
+                    .child_by_field_name("right")
+                    .is_some_and(|right| is_empty_string(right, self.src)));
+        if empty {
+            self.report(call, "GUI-001", "tooltip may be empty");
+        }
+    }
+
+    // GUI-002 -------------------------------------------------------------
+
+    fn check_model_construction(&mut self, call: Node, known: &HashSet<String>) {
+        let Some(name) = call
+            .child_by_field_name("function")
+            .and_then(|function| last_segment(function, self.src))
+        else {
+            return;
+        };
+        if !is_qt_model_base(name) && !known.contains(name) {
+            return;
+        }
+        let Some(arguments) = call.child_by_field_name("arguments") else {
+            return;
+        };
+        if arguments.kind() != "argument_list" {
+            return;
+        }
+        let has_parent =
+            code_children(arguments)
+                .into_iter()
+                .any(|argument| match argument.kind() {
+                    "keyword_argument" => {
+                        argument
+                            .child_by_field_name("name")
+                            .is_some_and(|key| self.text(key) == "parent")
+                            && argument
+                                .child_by_field_name("value")
+                                .is_some_and(|value| unparen(value).kind() != "none")
+                    }
+                    "list_splat" | "dictionary_splat" => true,
+                    _ => !is_literal(argument),
+                });
+        if !has_parent {
+            self.report(
+                call,
+                "GUI-002",
+                "Qt model or proxy is constructed without a parent",
+            );
+        }
+    }
+
+    fn check_qt_model_subclass(&mut self, class: Node, known: &HashSet<String>) {
+        let Some(superclasses) = class.child_by_field_name("superclasses") else {
+            return;
+        };
+        let bases = class_base_names(superclasses, self.src);
+        if !bases
+            .iter()
+            .any(|base| is_qt_model_base(base) || known.contains(base))
+        {
+            return;
+        }
+        let forwards = class
+            .child_by_field_name("body")
+            .and_then(|body| method(body, "__init__", self.src))
+            .is_some_and(|init| init_forwards_parent(init, self.src));
+        if !forwards {
+            self.report(
+                class,
+                "GUI-002",
+                "Qt model subclass initializer must accept parent and forward it to super().__init__()",
+            );
+        }
+    }
 }
-fn walk(node: Node, f: &mut impl FnMut(Node)) {
+
+// Syntax helpers ---------------------------------------------------------
+
+fn walk<'t>(node: Node<'t>, f: &mut impl FnMut(Node<'t>)) {
     f(node);
     let mut c = node.walk();
     for child in node.children(&mut c) {
         walk(child, f);
     }
 }
+
+/// Walks one function or class body without entering nested definitions or
+/// lambdas, whose statements belong to a different scope.
+fn walk_scope<'t>(node: Node<'t>, f: &mut impl FnMut(Node<'t>)) {
+    f(node);
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if matches!(
+            child.kind(),
+            "function_definition" | "class_definition" | "lambda"
+        ) {
+            continue;
+        }
+        walk_scope(child, f);
+    }
+}
+
 fn text<'a>(n: Node, src: &'a str) -> &'a str {
     &src[n.byte_range()]
 }
-fn is_inside_class(node: Node) -> bool {
+
+/// Named children, skipping the comment and backslash `line_continuation`
+/// extras that Tree-sitter may place between any two tokens.
+fn code_children(node: Node) -> Vec<Node> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .filter(|child| !is_extra(*child))
+        .collect()
+}
+
+fn is_extra(node: Node) -> bool {
+    matches!(node.kind(), "comment" | "line_continuation")
+}
+
+fn unparen(mut node: Node) -> Node {
+    while node.kind() == "parenthesized_expression" {
+        match code_children(node).first() {
+            Some(inner) => node = *inner,
+            None => break,
+        }
+    }
+    node
+}
+
+/// The operator tokens of a two-operand comparison (`==`, `is not`, ...),
+/// ignoring comments and line continuations between the operands.
+fn comparison_operator(comparison: Node, src: &str) -> String {
+    let mut cursor = comparison.walk();
+    let tokens = comparison
+        .children(&mut cursor)
+        .filter(|child| !child.is_named())
+        .map(|child| text(child, src))
+        .collect::<Vec<_>>();
+    collapse_whitespace(&tokens.join(" "))
+}
+
+fn collapse_whitespace(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The final name in `name` or `object.attribute`.
+fn last_segment<'a>(node: Node, src: &'a str) -> Option<&'a str> {
+    match node.kind() {
+        "identifier" => Some(text(node, src)),
+        "attribute" => node
+            .child_by_field_name("attribute")
+            .map(|attribute| text(attribute, src)),
+        _ => None,
+    }
+}
+
+fn enclosing_function(node: Node) -> Option<Node> {
     let mut parent = node.parent();
     while let Some(current) = parent {
-        if current.kind() == "class_definition" {
-            return true;
+        if current.kind() == "function_definition" {
+            return Some(current);
         }
         parent = current.parent();
     }
-    false
-}
-fn enabled(code: &str, cfg: &Config, strict: bool) -> bool {
-    strict || cfg.rules.get(code).copied().unwrap_or(true)
-}
-fn suppressed(node: Node, src: &str, code: &str) -> bool {
-    let line = src[..node.start_byte()].rfind('\n').map_or(0, |i| i + 1);
-    let end = src[line..].find('\n').map_or(src.len(), |i| line + i);
-    let line = &src[line..end];
-    if line.contains("# noqa") {
-        return true;
-    }
-    let name = rule(code).name;
-    line.find("# colint: ignore[")
-        .and_then(|i| line[i..].split_once('['))
-        .and_then(|(_, rest)| rest.split_once(']'))
-        .is_some_and(|(codes, _)| {
-            codes.split(',').any(|c| {
-                let c = c.trim();
-                c == code || c == name
-            })
-        })
-}
-fn add(
-    out: &mut Vec<Finding>,
-    path: &Path,
-    src: &str,
-    node: Node,
-    code: &str,
-    message: &str,
-    cfg: &Config,
-    strict: bool,
-) {
-    if !enabled(code, cfg, strict) || suppressed(node, src, code) {
-        return;
-    }
-    let r = rule(code);
-    let p = node.start_position();
-    out.push(Finding {
-        path: path.display().to_string(),
-        line: p.row + 1,
-        column: p.column + 1,
-        code: code.into(),
-        name: r.name.into(),
-        severity: r.severity,
-        message: message.into(),
-        recommendation: r.recommendation.into(),
-    });
+    None
 }
 
-fn nested_import_has_note(n: Node, src: &str) -> bool {
-    let first_in_group = first_import_in_group(n);
-    let before = &src[..first_in_group.start_byte()];
-    let mut meaningful = before.lines().rev().filter(|l| !l.trim().is_empty());
-    match meaningful.next() {
-        Some(line) if line.trim_start().starts_with('#') => {
-            let mut comments = vec![line];
-            for l in meaningful {
-                if l.trim_start().starts_with('#') {
-                    comments.push(l);
-                } else {
-                    break;
-                }
-            }
-            comments
-                .iter()
-                .any(|l| l.to_ascii_lowercase().contains("note"))
+fn enclosing_definition(node: Node) -> Option<Node> {
+    let mut parent = node.parent();
+    while let Some(current) = parent {
+        if matches!(current.kind(), "function_definition" | "class_definition") {
+            return Some(current);
         }
+        parent = current.parent();
+    }
+    None
+}
+
+/// The class whose body directly defines `function`, if it is a method.
+fn enclosing_class(function: Node) -> Option<Node> {
+    let mut parent = function.parent()?;
+    if parent.kind() == "decorated_definition" {
+        parent = parent.parent()?;
+    }
+    if parent.kind() != "block" {
+        return None;
+    }
+    parent
+        .parent()
+        .filter(|class| class.kind() == "class_definition")
+}
+
+fn has_decorator(function: Node, src: &str, name: &str) -> bool {
+    let Some(decorated) = function
+        .parent()
+        .filter(|parent| parent.kind() == "decorated_definition")
+    else {
+        return false;
+    };
+    let mut cursor = decorated.walk();
+    let found = decorated.named_children(&mut cursor).any(|decorator| {
+        decorator.kind() == "decorator"
+            && code_children(decorator)
+                .first()
+                .and_then(|expression| last_segment(*expression, src))
+                == Some(name)
+    });
+    found
+}
+
+/// The parameter's bound name, and whether it is a `*args`/`**kwargs` splat.
+fn parameter_name<'a>(parameter: Node, src: &'a str) -> Option<(&'a str, bool)> {
+    match parameter.kind() {
+        "identifier" => Some((text(parameter, src), false)),
+        "typed_parameter" => code_children(parameter)
+            .first()
+            .and_then(|inner| parameter_name(*inner, src)),
+        "default_parameter" | "typed_default_parameter" => parameter
+            .child_by_field_name("name")
+            .and_then(|name| parameter_name(name, src)),
+        "list_splat_pattern" | "dictionary_splat_pattern" => code_children(parameter)
+            .first()
+            .map(|name| (text(*name, src), true)),
+        _ => None,
+    }
+}
+
+fn parameter_annotation(parameter: Node) -> Option<Node> {
+    matches!(
+        parameter.kind(),
+        "typed_parameter" | "typed_default_parameter"
+    )
+    .then(|| parameter.child_by_field_name("type"))
+    .flatten()
+}
+
+/// The string literal that is the first statement of a function or class.
+fn docstring(definition: Node) -> Option<Node> {
+    let body = definition.child_by_field_name("body")?;
+    let first = *code_children(body).first()?;
+    if first.kind() != "expression_statement" {
+        return None;
+    }
+    let string = *code_children(first).first()?;
+    matches!(string.kind(), "string" | "concatenated_string").then_some(string)
+}
+
+/// The raw source between a string's quotes, unless it is a bytes or
+/// f-string literal.
+fn string_body<'a>(string: Node, src: &'a str) -> Option<&'a str> {
+    if string.kind() != "string" {
+        return None;
+    }
+    let mut cursor = string.walk();
+    let children = string.children(&mut cursor).collect::<Vec<_>>();
+    let start = children.iter().find(|c| c.kind() == "string_start")?;
+    let end = children.iter().rev().find(|c| c.kind() == "string_end")?;
+    let prefix = text(*start, src).to_ascii_lowercase();
+    if prefix.contains('b') || prefix.contains('f') {
+        return None;
+    }
+    Some(&src[start.end_byte()..end.start_byte()])
+}
+
+fn is_empty_string(node: Node, src: &str) -> bool {
+    let node = unparen(node);
+    match node.kind() {
+        "string" => string_body(node, src).is_some_and(str::is_empty),
+        "concatenated_string" => code_children(node)
+            .into_iter()
+            .all(|part| is_empty_string(part, src)),
         _ => false,
     }
 }
 
-/// Returns the first consecutive nested import in this block. Comments and
-/// whitespace are not named syntax nodes, so they naturally do not split a
-/// group; multiline imports remain one Tree-sitter statement.
-fn first_import_in_group(n: Node) -> Node {
-    let Some(parent) = n.parent() else {
-        return n;
-    };
-    let mut imports = Vec::new();
-    let mut cursor = parent.walk();
-    for child in parent.named_children(&mut cursor) {
-        if child.end_byte() <= n.start_byte() {
-            imports.push(child);
-        } else {
-            break;
-        }
+fn is_literal(node: Node) -> bool {
+    let node = unparen(node);
+    match node.kind() {
+        "string"
+        | "concatenated_string"
+        | "integer"
+        | "float"
+        | "true"
+        | "false"
+        | "none"
+        | "list"
+        | "dictionary"
+        | "tuple"
+        | "set" => true,
+        "unary_operator" => node
+            .child_by_field_name("argument")
+            .is_some_and(|argument| matches!(argument.kind(), "integer" | "float")),
+        _ => false,
     }
-    let mut first = n;
-    for child in imports.into_iter().rev() {
-        if matches!(child.kind(), "import_statement" | "import_from_statement") {
-            first = child;
-        } else {
-            break;
-        }
-    }
-    first
 }
-fn local_return_types(root: Node, src: &str) -> HashMap<String, String> {
-    let mut x = HashMap::new();
-    walk(root, &mut |n| {
-        if n.kind() == "function_definition" {
-            if let (Some(name), Some(ret)) = (
-                n.child_by_field_name("name"),
-                n.child_by_field_name("return_type"),
-            ) {
-                x.insert(text(name, src).to_string(), text(ret, src).to_string());
+
+fn keyword_argument<'t>(call: Node<'t>, name: &str, src: &str) -> Option<Node<'t>> {
+    let arguments = call.child_by_field_name("arguments")?;
+    code_children(arguments).into_iter().find_map(|argument| {
+        (argument.kind() == "keyword_argument"
+            && argument
+                .child_by_field_name("name")
+                .is_some_and(|key| text(key, src) == name))
+        .then(|| argument.child_by_field_name("value"))
+        .flatten()
+    })
+}
+
+fn method<'t>(class_body: Node<'t>, name: &str, src: &str) -> Option<Node<'t>> {
+    class_methods(class_body, src).remove(name)
+}
+
+fn class_methods<'t>(class_body: Node<'t>, src: &str) -> HashMap<String, Node<'t>> {
+    let mut methods = HashMap::new();
+    for child in code_children(class_body) {
+        let function = if child.kind() == "decorated_definition" {
+            child.child_by_field_name("definition")
+        } else {
+            Some(child)
+        };
+        if let Some(function) = function.filter(|f| f.kind() == "function_definition") {
+            if let Some(name) = function.child_by_field_name("name") {
+                methods.insert(text(name, src).to_string(), function);
             }
+        }
+    }
+    methods
+}
+
+// Suppressions ------------------------------------------------------------
+
+/// Suppressions are read from real comments on the finding's first line, so
+/// `# noqa` inside a string literal does not hide anything.
+fn suppressed(node: Node, src: &str, code: &str) -> bool {
+    let row = node.start_position().row;
+    let mut root = node;
+    while let Some(parent) = root.parent() {
+        root = parent;
+    }
+    let mut comments = Vec::new();
+    collect_comments_on_row(root, row, src, &mut comments);
+    comments
+        .iter()
+        .any(|comment| comment_suppresses(comment, code))
+}
+
+fn collect_comments_on_row<'a>(node: Node, row: usize, src: &'a str, out: &mut Vec<&'a str>) {
+    if node.start_position().row > row || node.end_position().row < row {
+        return;
+    }
+    if node.kind() == "comment" {
+        out.push(text(node, src));
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_comments_on_row(child, row, src, out);
+    }
+}
+
+/// `# noqa` suppresses everything; `# noqa: A,B` and
+/// `# colint: ignore[A,B]` suppress only the listed rule codes or names.
+fn comment_suppresses(comment: &str, code: &str) -> bool {
+    let noqa = static_regex!(r"(?i)#\s*noqa\b(?:\s*:\s*([\w\-]+(?:\s*,\s*[\w\-]+)*))?");
+    let ignore = static_regex!(r"(?i)#\s*colint\s*:\s*ignore\s*\[([^\]]*)\]");
+    let name = rule(code).name;
+    let lists = |list: &str| {
+        list.split(',').any(|entry| {
+            let entry = entry.trim();
+            entry.eq_ignore_ascii_case(code) || entry.eq_ignore_ascii_case(name)
+        })
+    };
+    noqa.captures_iter(comment)
+        .any(|captures| captures.get(1).map_or(true, |list| lists(list.as_str())))
+        || ignore
+            .captures_iter(comment)
+            .any(|captures| lists(&captures[1]))
+}
+
+// Configuration -------------------------------------------------------------
+
+fn enabled(code: &str, cfg: &Config, strict: bool) -> bool {
+    strict || cfg.rules.get(code).copied().unwrap_or(true)
+}
+
+/// A path is test code when its file is `test_*.py`, `*_test.py`,
+/// `conftest.py`, or it lives below a `test`, `tests`, or `testing` directory.
+/// Substrings such as `latest.py` or `contest/` are not test code.
+fn is_test_path(path: &Path) -> bool {
+    let file = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let stem = file.strip_suffix(".py").unwrap_or(&file);
+    if stem.starts_with("test_")
+        || stem.ends_with("_test")
+        || matches!(stem, "test" | "tests" | "conftest")
+    {
+        return true;
+    }
+    path.parent().is_some_and(|parent| {
+        parent.components().any(|component| {
+            matches!(
+                component
+                    .as_os_str()
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "test" | "tests" | "testing"
+            )
+        })
+    })
+}
+
+// API-002 helpers -----------------------------------------------------------
+
+/// Identifier nodes that read `name`, excluding attribute names
+/// (`other.name`) and keyword names (`call(name=...)`).
+fn references<'t>(scope: Node<'t>, name: &str, src: &str) -> Vec<Node<'t>> {
+    let mut found = Vec::new();
+    walk(scope, &mut |node| {
+        if node.kind() != "identifier" || text(node, src) != name {
+            return;
+        }
+        let Some(parent) = node.parent() else {
+            found.push(node);
+            return;
+        };
+        let field = |field| parent.child_by_field_name(field) == Some(node);
+        let is_attribute_name = parent.kind() == "attribute" && field("attribute");
+        let is_keyword_name = parent.kind() == "keyword_argument" && field("name");
+        if !is_attribute_name && !is_keyword_name {
+            found.push(node);
         }
     });
-    x
+    found
 }
-fn check_assignment(
-    out: &mut Vec<Finding>,
-    path: &Path,
-    src: &str,
-    n: Node,
-    returns: &HashMap<String, String>,
-    cfg: &Config,
-    strict: bool,
-) {
-    let t = text(n, src);
-    if let Some((left, right)) = t.split_once('=') {
-        if left.contains(':') {
-            let annotation = left.split(':').nth(1).unwrap_or("").trim();
-            let rhs = right.trim();
-            let callee = rhs.split('(').next().unwrap_or("").trim();
-            if returns.get(callee).is_some_and(|r| r.trim() == annotation) {
-                add(
-                    out,
-                    path,
-                    src,
-                    n,
-                    "API-003",
-                    "local annotation duplicates the direct callee return type",
-                    cfg,
-                    strict,
-                );
+
+/// The `name.method(...)` call when `reference` is its receiver.
+fn query_call(reference: Node) -> Option<Node> {
+    let attribute = reference
+        .parent()
+        .filter(|parent| parent.kind() == "attribute")?;
+    if attribute.child_by_field_name("object") != Some(reference) {
+        return None;
+    }
+    attribute.parent().filter(|call| {
+        call.kind() == "call" && call.child_by_field_name("function") == Some(attribute)
+    })
+}
+
+/// The function that directly consumes a queried value, either as an
+/// argument (`consume(thing.value())`) or through a local
+/// (`value = thing.value(); consume(value)`).
+fn lofting_target(query: Node, body: Node, src: &str) -> Option<String> {
+    let mut node = query;
+    loop {
+        let parent = node.parent()?;
+        match parent.kind() {
+            "parenthesized_expression" | "keyword_argument" => node = parent,
+            "argument_list" => {
+                return parent
+                    .parent()
+                    .and_then(|call| call.child_by_field_name("function"))
+                    .and_then(|function| last_segment(function, src))
+                    .map(str::to_string);
             }
-        }
-    }
-}
-fn check_call(out: &mut Vec<Finding>, path: &Path, src: &str, n: Node, cfg: &Config, strict: bool) {
-    let t = text(n, src);
-    if (t.contains("logging.") || t.contains("logger."))
-        && (t.contains("%s") || t.contains("%r"))
-        && !t.contains("\"%s\"")
-        && !t.contains("'%s'")
-        && !t.contains("\"%r\"")
-        && !t.contains("'%r'")
-    {
-        add(
-            out,
-            path,
-            src,
-            n,
-            "STY-003",
-            "logging placeholder is not quoted",
-            cfg,
-            strict,
-        );
-    }
-    if (t.contains("QStandardItemModel(") || t.contains("QSortFilterProxyModel("))
-        && (t.ends_with("()") || t.contains("(parent=None"))
-    {
-        add(
-            out,
-            path,
-            src,
-            n,
-            "GUI-002",
-            "Qt model or proxy is constructed without a parent",
-            cfg,
-            strict,
-        );
-    }
-    if t.contains("setToolTip(")
-        && (t.contains("\"\"")
-            || t.contains("''")
-            || t.contains(" or \"\"")
-            || t.contains(" or ''"))
-    {
-        add(
-            out,
-            path,
-            src,
-            n,
-            "GUI-001",
-            "tooltip may be empty",
-            cfg,
-            strict,
-        );
-    }
-}
-fn check_function(
-    out: &mut Vec<Finding>,
-    path: &Path,
-    src: &str,
-    n: Node,
-    cfg: &Config,
-    strict: bool,
-) {
-    let t = text(n, src);
-    let body = n.child_by_field_name("body");
-    check_empty_string_returns(out, path, src, n, cfg, strict);
-    if !cfg.api002_skip_private_definitions || !is_private_definition(n, src) {
-        check_lofting(out, path, src, n, cfg, strict);
-    }
-    check_docstring_markup(out, path, src, n, &cfg.docstring_convention, cfg, strict);
-    if let Some(b) = body {
-        let first = b.named_child(0);
-        if first.is_some_and(|x| x.kind() == "if_statement") {
-            let i = text(first.unwrap(), src);
-            if i.contains("return") && i.lines().count() <= 3 {
-                add(
-                    out,
-                    path,
-                    src,
-                    first.unwrap(),
-                    "API-001",
-                    "function immediately returns based on a predicate",
-                    cfg,
-                    strict,
-                );
+            "assignment" if parent.child_by_field_name("right") == Some(node) => {
+                let local = parent
+                    .child_by_field_name("left")
+                    .filter(|left| left.kind() == "identifier")?;
+                return consumer_of(body, text(local, src), src);
             }
+            _ => return None,
         }
     }
-    if t.contains("Raises:") {
-        let direct = body.is_some_and(|b| contains_direct_kind(b, "raise_statement"));
-        if !direct {
-            add(
-                out,
-                path,
-                src,
-                n,
-                "DOC-002",
-                "docstring documents Raises but this function has no direct raise",
-                cfg,
-                strict,
-            );
+}
+
+fn consumer_of(body: Node, local: &str, src: &str) -> Option<String> {
+    let mut consumer = None;
+    walk(body, &mut |node| {
+        if consumer.is_some() || node.kind() != "call" {
+            return;
         }
+        let Some(arguments) = node.child_by_field_name("arguments") else {
+            return;
+        };
+        let passes_local = code_children(arguments).into_iter().any(|argument| {
+            let value = if argument.kind() == "keyword_argument" {
+                argument.child_by_field_name("value")
+            } else {
+                Some(argument)
+            };
+            value.is_some_and(|value| {
+                let value = unparen(value);
+                value.kind() == "identifier" && text(value, src) == local
+            })
+        });
+        if passes_local {
+            consumer = node
+                .child_by_field_name("function")
+                .and_then(|function| last_segment(function, src))
+                .map(str::to_string);
+        }
+    });
+    consumer
+}
+
+fn join_human(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [item] => item.clone(),
+        [first, second] => format!("{first} and {second}"),
+        _ => format!(
+            "{}, and {}",
+            items[..items.len() - 1].join(", "),
+            items.last().unwrap()
+        ),
     }
 }
 
@@ -738,55 +1448,564 @@ fn is_private_definition(function: Node, src: &str) -> bool {
     false
 }
 
-fn contains_direct_kind(node: Node, kind: &str) -> bool {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == kind {
+// API-003 helpers -----------------------------------------------------------
+
+/// Return annotations of functions that are not methods, keyed by name.
+fn local_return_types(root: Node, src: &str) -> HashMap<String, String> {
+    return_types(root, src, false)
+}
+
+/// Return annotations of methods, keyed by method name.
+fn local_method_return_types(root: Node, src: &str) -> HashMap<String, String> {
+    return_types(root, src, true)
+}
+
+fn return_types(root: Node, src: &str, methods: bool) -> HashMap<String, String> {
+    let mut x = HashMap::new();
+    walk(root, &mut |n| {
+        if n.kind() == "function_definition" && enclosing_class(n).is_some() == methods {
+            if let (Some(name), Some(ret)) = (
+                n.child_by_field_name("name"),
+                n.child_by_field_name("return_type"),
+            ) {
+                x.insert(text(name, src).to_string(), text(ret, src).to_string());
+            }
+        }
+    });
+    x
+}
+
+/// Removes whitespace, trailing commas, and one level of string quoting, so
+/// `list[ str ]`, `list[str,]`, and `"list[str]"` compare equal.
+fn normalize_annotation(annotation: &str) -> String {
+    let compact = static_regex!(r"#[^\n]*")
+        .replace_all(annotation, "")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .replace(",]", "]");
+    for quote in ['"', '\''] {
+        if let Some(inner) = compact
+            .strip_prefix(quote)
+            .and_then(|rest| rest.strip_suffix(quote))
+        {
+            return inner.to_string();
+        }
+    }
+    compact
+}
+
+// API-004 / API-006 helpers -------------------------------------------------
+
+fn annotation_allows_none(annotation: &str) -> bool {
+    static_regex!(r"\bNone\b|\bOptional\s*\[").is_match(annotation)
+}
+
+/// Parameters and annotated locals of `function` whose annotation includes
+/// `None` (`X | None`, `None | X`, `Optional[X]`, `Union[X, None]`).
+fn optional_names(function: Node, src: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    if let Some(parameters) = function.child_by_field_name("parameters") {
+        for parameter in code_children(parameters) {
+            if let (Some((name, false)), Some(annotation)) = (
+                parameter_name(parameter, src),
+                parameter_annotation(parameter),
+            ) {
+                if annotation_allows_none(text(annotation, src)) {
+                    names.insert(name.to_string());
+                }
+            }
+        }
+    }
+    if let Some(body) = function.child_by_field_name("body") {
+        walk_scope(body, &mut |node| {
+            if node.kind() != "assignment" {
+                return;
+            }
+            if let (Some(left), Some(annotation)) = (
+                node.child_by_field_name("left"),
+                node.child_by_field_name("type"),
+            ) {
+                if left.kind() == "identifier" && annotation_allows_none(text(annotation, src)) {
+                    names.insert(text(left, src).to_string());
+                }
+            }
+        });
+    }
+    names
+}
+
+// DOC-001 helpers -----------------------------------------------------------
+
+/// Words written as `*word*` or `**word**`, not embedded in a longer word or
+/// expression such as `2*x*3`.
+fn emphasized_words(docstring: &str) -> HashSet<&str> {
+    let emphasis = static_regex!(r"\*\*?([A-Za-z_]\w*)\*\*?");
+    let boundary =
+        |c: Option<char>| c.map_or(true, |c| !(c.is_alphanumeric() || c == '_' || c == '*'));
+    emphasis
+        .captures_iter(docstring)
+        .filter(|captures| {
+            let whole = captures.get(0).expect("whole match");
+            boundary(docstring[..whole.start()].chars().next_back())
+                && boundary(docstring[whole.end()..].chars().next())
+        })
+        .map(|captures| captures.get(1).expect("word group").as_str())
+        .collect()
+}
+
+// DOC-002 helpers -----------------------------------------------------------
+
+/// The exception names listed in a Google-style `Raises:` section, or `None`
+/// when the docstring has no such section.
+fn documented_raises(docstring: &str) -> Option<Vec<String>> {
+    let lines = docstring.lines().collect::<Vec<_>>();
+    let header = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("Raises:"))?;
+    let indentation = |line: &str| line.len() - line.trim_start().len();
+    let header_indentation = indentation(lines[header]);
+    let entry = static_regex!(r"^([A-Za-z_][\w.]*)\s*(?::|$)");
+    let mut entry_indentation = None;
+    let mut names = Vec::new();
+    // The inline form, `Raises: ValueError if ...`.
+    let inline = lines[header].trim_start()["Raises:".len()..].trim();
+    if let Some(name) = static_regex!(r"^([A-Z][\w.]*)").captures(inline) {
+        let name = &name[1];
+        names.push(name.rsplit('.').next().unwrap_or(name).to_string());
+    }
+    for line in &lines[header + 1..] {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let current = indentation(line);
+        if current <= header_indentation {
+            break;
+        }
+        if current != *entry_indentation.get_or_insert(current) {
+            continue;
+        }
+        if let Some(captures) = entry.captures(line.trim()) {
+            let name = &captures[1];
+            names.push(name.rsplit('.').next().unwrap_or(name).to_string());
+        }
+    }
+    Some(names)
+}
+
+#[derive(Default)]
+struct DirectRaises {
+    /// The function has at least one direct `raise`.
+    any: bool,
+    /// A raise whose exception type cannot be determined statically.
+    unknown: bool,
+    names: HashSet<String>,
+}
+
+fn direct_raises(body: Node, src: &str) -> DirectRaises {
+    let mut raises = DirectRaises::default();
+    walk_scope(body, &mut |node| {
+        if node.kind() != "raise_statement" {
+            return;
+        }
+        raises.any = true;
+        let exception = code_children(node).first().map(|n| unparen(*n));
+        let resolved = match exception {
+            None => handled_exceptions(node, None, src),
+            Some(exception) => {
+                let class = if exception.kind() == "call" {
+                    exception.child_by_field_name("function")
+                } else {
+                    Some(exception)
+                };
+                match class.and_then(|class| last_segment(class, src)) {
+                    Some(name) if name.starts_with(|c: char| c.is_ascii_uppercase()) => {
+                        Some(vec![name.to_string()])
+                    }
+                    Some(name) => handled_exceptions(node, Some(name), src),
+                    None => None,
+                }
+            }
+        };
+        match resolved {
+            Some(names) => raises.names.extend(names),
+            None => raises.unknown = true,
+        }
+    });
+    raises
+}
+
+/// The exception types of the nearest enclosing `except` clause, for a bare
+/// `raise` (`alias` is `None`) or `raise alias` of that clause's `as` name.
+fn handled_exceptions(node: Node, alias: Option<&str>, src: &str) -> Option<Vec<String>> {
+    let mut parent = node.parent();
+    while let Some(current) = parent {
+        if matches!(current.kind(), "function_definition" | "class_definition") {
+            return None;
+        }
+        if current.kind() == "except_clause" {
+            let body = code_children(current)
+                .into_iter()
+                .find(|child| child.kind() == "block")?;
+            let header = src[current.start_byte()..body.start_byte()]
+                .trim()
+                .trim_start_matches("except")
+                .trim_start_matches('*')
+                .trim()
+                .trim_end_matches(':');
+            let (types, bound) = match header.rsplit_once(" as ") {
+                Some((types, bound)) => (types, Some(bound.trim())),
+                None => (header, None),
+            };
+            if alias.is_some() && alias != bound {
+                return None;
+            }
+            let names = types
+                .trim()
+                .trim_start_matches('(')
+                .trim_end_matches(')')
+                .split(',')
+                .map(|name| name.trim().rsplit('.').next().unwrap_or("").to_string())
+                .filter(|name| !name.is_empty())
+                .collect::<Vec<_>>();
+            return (!names.is_empty()).then_some(names);
+        }
+        parent = current.parent();
+    }
+    None
+}
+
+fn local_class_bases(root: Node, src: &str) -> HashMap<String, Vec<String>> {
+    let mut bases = HashMap::new();
+    walk(root, &mut |node| {
+        if node.kind() != "class_definition" {
+            return;
+        }
+        if let (Some(name), Some(superclasses)) = (
+            node.child_by_field_name("name"),
+            node.child_by_field_name("superclasses"),
+        ) {
+            bases.insert(
+                text(name, src).to_string(),
+                class_base_names(superclasses, src),
+            );
+        }
+    });
+    bases
+}
+
+fn is_same_or_subclass(
+    raised: &str,
+    documented: &str,
+    bases: &HashMap<String, Vec<String>>,
+) -> bool {
+    let mut pending = vec![raised.to_string()];
+    let mut seen = HashSet::new();
+    while let Some(name) = pending.pop() {
+        if name == documented {
             return true;
         }
-        if child.kind() != "function_definition" && contains_direct_kind(child, kind) {
-            return true;
+        if seen.insert(name.clone()) {
+            pending.extend(bases.get(&name).into_iter().flatten().cloned());
         }
     }
     false
 }
 
-fn check_qt_model_subclass(
-    out: &mut Vec<Finding>,
-    path: &Path,
-    src: &str,
-    class: Node,
-    qt_model_classes: &HashSet<String>,
-    cfg: &Config,
-    strict: bool,
-) {
-    let Some(superclasses) = class.child_by_field_name("superclasses") else {
-        return;
+// STY-001 helpers -----------------------------------------------------------
+
+/// An import is justified by a `# NOTE` comment block directly above it, or
+/// above an earlier import in the same contiguous group. Blank lines and
+/// other comments do not split a group; any other statement does.
+fn nested_import_has_note(import: Node, src: &str) -> bool {
+    let mut current = import;
+    loop {
+        if preceding_comments_have_note(current, src) {
+            return true;
+        }
+        let mut previous = current.prev_named_sibling();
+        while let Some(node) = previous.filter(|node| is_extra(*node)) {
+            previous = node.prev_named_sibling();
+        }
+        match previous {
+            Some(node) if matches!(node.kind(), "import_statement" | "import_from_statement") => {
+                current = node;
+            }
+            _ => return false,
+        }
+    }
+}
+
+fn preceding_comments_have_note(node: Node, src: &str) -> bool {
+    let note = static_regex!(r"(?i)^#+\s*note\b");
+    src[..node.start_byte()]
+        .lines()
+        .rev()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take_while(|line| line.starts_with('#'))
+        .any(|line| note.is_match(line))
+}
+
+// STY-003 helpers -----------------------------------------------------------
+
+const LOGGING_METHODS: &[&str] = &[
+    "debug",
+    "info",
+    "warning",
+    "warn",
+    "error",
+    "exception",
+    "critical",
+    "fatal",
+    "log",
+];
+
+/// The message argument of a call such as `logger.info(message, ...)`,
+/// `logging.log(level, message, ...)`, or `self._log.warning(message)`.
+fn logging_message_argument<'t>(call: Node<'t>, src: &str) -> Option<Node<'t>> {
+    let function = call.child_by_field_name("function")?;
+    if function.kind() != "attribute" {
+        return None;
+    }
+    let method = text(function.child_by_field_name("attribute")?, src);
+    if !LOGGING_METHODS.contains(&method) {
+        return None;
+    }
+    let object = unparen(function.child_by_field_name("object")?);
+    let is_logger = match object.kind() {
+        "call" => object
+            .child_by_field_name("function")
+            .and_then(|f| last_segment(f, src))
+            .is_some_and(|name| name == "getLogger"),
+        _ => last_segment(object, src).is_some_and(|name| {
+            static_regex!(r"(?i)(?:^|_)(?:log|logger|logging)$").is_match(name)
+        }),
     };
-    let bases = class_base_names(superclasses, src);
-    if !bases
+    if !is_logger {
+        return None;
+    }
+    let arguments = call.child_by_field_name("arguments")?;
+    let positional = code_children(arguments)
+        .into_iter()
+        .filter(|argument| argument.kind() != "keyword_argument")
+        .collect::<Vec<_>>();
+    positional
+        .get(usize::from(method == "log"))
+        .map(|argument| unparen(*argument))
+}
+
+/// Whether a `%s` placeholder (including `%(name)s` and `%-10s`) is not
+/// wrapped in matching quotes. `%r` already shows quotes and `%%` is a literal.
+fn has_unquoted_placeholder(body: &str) -> bool {
+    let placeholder =
+        static_regex!(r"^%(?:\([^)]*\))?[#0 +\-]*(?:\*|\d+)?(?:\.(?:\*|\d+))?([a-zA-Z])");
+    let mut index = 0;
+    while let Some(offset) = body[index..].find('%') {
+        let start = index + offset;
+        if body[start + 1..].starts_with('%') {
+            index = start + 2;
+            continue;
+        }
+        let Some(captures) = placeholder.captures(&body[start..]) else {
+            index = start + 1;
+            continue;
+        };
+        let end = start + captures[0].len();
+        if &captures[1] == "s" {
+            let before = body[..start].chars().next_back();
+            let after = body[end..].trim_start_matches('\\').chars().next();
+            let quoted = matches!(before, Some('"' | '\'')) && before == after;
+            if !quoted {
+                return true;
+            }
+        }
+        index = end;
+    }
+    false
+}
+
+// STY-004 helpers -----------------------------------------------------------
+
+fn is_main_guard(node: Node, src: &str) -> bool {
+    if node.kind() != "if_statement" {
+        return false;
+    }
+    let Some(condition) = node.child_by_field_name("condition") else {
+        return false;
+    };
+    let condition = text(condition, src)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .replace('\'', "\"");
+    matches!(
+        condition.as_str(),
+        "__name__==\"__main__\"" | "\"__main__\"==__name__"
+    )
+}
+
+// GUI-001 helpers -----------------------------------------------------------
+
+const WIDGET_SUFFIXES: &[&str] = &["Widget", "Button", "Label", "ComboBox"];
+
+fn is_widget_class(name: &str, custom: &HashSet<String>) -> bool {
+    custom.contains(name)
+        || (name.starts_with(|c: char| c.is_ascii_uppercase())
+            && WIDGET_SUFFIXES.iter().any(|suffix| name.ends_with(suffix)))
+}
+
+/// Classes defined in this module that derive, directly or through another
+/// local class, from a `*Widget` base.
+fn custom_widget_classes(root: Node, src: &str) -> HashSet<String> {
+    let bases = local_class_bases(root, src);
+    let mut classes = HashSet::new();
+    loop {
+        let before = classes.len();
+        for (name, parents) in &bases {
+            if parents
+                .iter()
+                .any(|parent| parent.ends_with("Widget") || classes.contains(parent))
+            {
+                classes.insert(name.clone());
+            }
+        }
+        if classes.len() == before {
+            return classes;
+        }
+    }
+}
+
+/// The source texts that may configure a widget constructed by `node`.
+fn tooltip_scope<'a>(node: Node, src: &'a str) -> Vec<&'a str> {
+    let Some(mut function) = enclosing_function(node) else {
+        return vec![src];
+    };
+    while enclosing_class(function).is_none() {
+        match enclosing_function(function) {
+            Some(outer) => function = outer,
+            None => return vec![text(function, src)],
+        }
+    }
+    let Some(body) = enclosing_class(function).and_then(|c| c.child_by_field_name("body")) else {
+        return vec![text(function, src)];
+    };
+    let methods = class_methods(body, src);
+    let Some(name) = function
+        .child_by_field_name("name")
+        .map(|name| text(name, src))
+    else {
+        return vec![text(function, src)];
+    };
+    let mut scope = HashSet::new();
+    for root in methods.keys() {
+        let reachable = reachable_methods(root, &methods, src);
+        if reachable.contains(name) {
+            scope.extend(reachable);
+        }
+    }
+    let mut names = scope.into_iter().collect::<Vec<_>>();
+    names.sort();
+    names
         .iter()
-        .any(|base| is_qt_model_base(base) || qt_model_classes.contains(base))
-    {
-        return;
+        .filter_map(|name| methods.get(name))
+        .map(|method| text(*method, src))
+        .collect()
+}
+
+/// Methods reachable from `start` through `self.method()` calls. The visited
+/// set deliberately makes recursive helper graphs finite.
+fn reachable_methods(start: &str, methods: &HashMap<String, Node>, src: &str) -> HashSet<String> {
+    let mut reachable = HashSet::new();
+    let mut pending = vec![start.to_string()];
+    while let Some(name) = pending.pop() {
+        if !reachable.insert(name.clone()) {
+            continue;
+        }
+        let Some(method) = methods.get(&name).copied() else {
+            continue;
+        };
+        for called in called_instance_methods(method, src) {
+            if methods.contains_key(&called) && !reachable.contains(&called) {
+                pending.push(called);
+            }
+        }
     }
-    let class_text = text(class, src);
-    let has_parent_parameter =
-        class_text.contains("def __init__(") && class_text.contains("parent");
-    let forwards_parent = class_text.contains("super().__init__(parent")
-        || class_text.contains("super().__init__(parent=");
-    if !has_parent_parameter || !forwards_parent {
-        add(
-            out,
-            path,
-            src,
-            class,
-            "GUI-002",
-            "Qt model subclass initializer must accept parent and forward it to super().__init__()",
-            cfg,
-            strict,
-        );
+    reachable
+}
+
+fn called_instance_methods(method: Node, src: &str) -> HashSet<String> {
+    let mut calls = HashSet::new();
+    let Some(body) = method.child_by_field_name("body") else {
+        return calls;
+    };
+    walk_scope(body, &mut |node| {
+        if node.kind() != "call" {
+            return;
+        }
+        let Some(function) = node.child_by_field_name("function") else {
+            return;
+        };
+        let Some(attribute) = function.child_by_field_name("attribute") else {
+            return;
+        };
+        let Some(object) = function.child_by_field_name("object") else {
+            return;
+        };
+        if text(object, src) == "self" {
+            calls.insert(text(attribute, src).to_string());
+        }
+    });
+    calls
+}
+
+// GUI-002 helpers -----------------------------------------------------------
+
+/// Whether `__init__` accepts a parent (by name or through `*args`/`**kwargs`)
+/// and passes it to `super().__init__(...)` or `Base.__init__(self, ...)`.
+fn init_forwards_parent(init: Node, src: &str) -> bool {
+    let Some(parameters) = init.child_by_field_name("parameters") else {
+        return false;
+    };
+    let forwarded = code_children(parameters)
+        .into_iter()
+        .filter_map(|parameter| parameter_name(parameter, src))
+        .filter(|(name, splat)| *splat || *name == "parent")
+        .map(|(name, _)| name)
+        .collect::<HashSet<_>>();
+    if forwarded.is_empty() {
+        return false;
     }
+    let Some(body) = init.child_by_field_name("body") else {
+        return false;
+    };
+    let mut forwards = false;
+    walk_scope(body, &mut |node| {
+        if forwards || node.kind() != "call" {
+            return;
+        }
+        let Some(function) = node.child_by_field_name("function") else {
+            return;
+        };
+        if last_segment(function, src) != Some("__init__") {
+            return;
+        }
+        let Some(arguments) = node.child_by_field_name("arguments") else {
+            return;
+        };
+        forwards = code_children(arguments).into_iter().any(|argument| {
+            let value = match argument.kind() {
+                "keyword_argument" => argument.child_by_field_name("value"),
+                "list_splat" | "dictionary_splat" => code_children(argument).first().copied(),
+                _ => Some(argument),
+            };
+            value.is_some_and(|value| {
+                let value = unparen(value);
+                value.kind() == "identifier" && forwarded.contains(text(value, src))
+            })
+        });
+    });
+    forwards
 }
 
 /// Finds Qt model/proxy subclasses across all input files.  This deliberately
@@ -816,7 +2035,7 @@ fn qt_model_classes(sources: &[(PathBuf, String)]) -> HashSet<String> {
                     ));
                 }
             }
-            "import_from_statement" => aliases.extend(imported_aliases(text(node, src))),
+            "import_from_statement" => aliases.extend(imported_aliases(node, src)),
             _ => {}
         });
     }
@@ -850,479 +2069,55 @@ fn is_qt_model_base(name: &str) -> bool {
             | "QAbstractListModel"
             | "QAbstractTableModel"
             | "QAbstractProxyModel"
+            | "QConcatenateTablesProxyModel"
+            | "QFileSystemModel"
             | "QIdentityProxyModel"
             | "QSortFilterProxyModel"
             | "QStandardItemModel"
+            | "QStringListModel"
+            | "QTransposeProxyModel"
     )
 }
 
+/// The final name of each positional base class (`pkg.Base[T]` -> `Base`).
 fn class_base_names(superclasses: Node, src: &str) -> Vec<String> {
-    text(superclasses, src)
-        .trim()
-        .trim_start_matches('(')
-        .trim_end_matches(')')
-        .split(',')
-        .filter_map(|base| base.trim().rsplit('.').next())
-        .map(|base| base.trim().to_string())
-        .filter(|base| !base.is_empty())
+    code_children(superclasses)
+        .into_iter()
+        .filter_map(|base| {
+            let base = if base.kind() == "subscript" {
+                base.child_by_field_name("value")?
+            } else {
+                base
+            };
+            last_segment(base, src).map(str::to_string)
+        })
         .collect()
 }
 
-fn imported_aliases(statement: &str) -> Vec<(String, String)> {
-    let normalized = statement.replace('\n', " ");
-    let Some((_, imported)) = normalized.split_once(" import ") else {
-        return vec![];
-    };
-    imported
-        .trim()
-        .trim_start_matches('(')
-        .trim_end_matches(')')
-        .split(',')
-        .filter_map(|item| {
-            let mut parts = item.split_whitespace();
-            let original = parts.next()?;
-            let alias = match (parts.next(), parts.next()) {
-                (Some("as"), Some(alias)) => alias,
-                _ => original,
+/// `(original, alias)` pairs bound by a `from module import ...` statement.
+fn imported_aliases(statement: Node, src: &str) -> Vec<(String, String)> {
+    let mut cursor = statement.walk();
+    statement
+        .children_by_field_name("name", &mut cursor)
+        .filter_map(|name| {
+            let (original, alias) = if name.kind() == "aliased_import" {
+                (
+                    name.child_by_field_name("name")?,
+                    name.child_by_field_name("alias")?,
+                )
+            } else {
+                (name, name)
             };
+            let original = text(original, src);
+            let original = original.rsplit('.').next().unwrap_or(original);
+            let alias = text(alias, src);
             Some((original.to_string(), alias.to_string()))
         })
         .collect()
 }
-fn check_none_comparison(
-    out: &mut Vec<Finding>,
-    path: &Path,
-    src: &str,
-    n: Node,
-    cfg: &Config,
-    strict: bool,
-) {
-    let t = text(n, src);
-    let function = n.parent().and_then(|mut p| {
-        while p.kind() != "function_definition" {
-            p = p.parent()?;
-        }
-        Some(p)
-    });
-    let optional = function.is_some_and(|f| text(f, src).contains(" | None"));
-    if optional && (t.contains(" is not None") || t.contains(" is None")) {
-        add(
-            out,
-            path,
-            src,
-            n,
-            "API-006",
-            "consider a polymorphic truthiness check instead of `is not None`",
-            cfg,
-            strict,
-        );
-    }
-}
 
-fn check_empty_string_returns(
-    out: &mut Vec<Finding>,
-    path: &Path,
-    src: &str,
-    function: Node,
-    cfg: &Config,
-    strict: bool,
-) {
-    let Some(body) = function.child_by_field_name("body") else {
-        return;
-    };
-    let return_type = function
-        .child_by_field_name("return_type")
-        .map(|n| text(n, src))
-        .unwrap_or("None");
-    walk(body, &mut |node| {
-        if node.kind() == "return_statement"
-            && matches!(text(node, src).trim(), "return \"\"" | "return ''")
-        {
-            let message = if return_type.contains("None") {
-                "empty string is returned; use `return None`"
-            } else {
-                "empty string is returned; use `return None` and add `None` to this function's return annotation"
-            };
-            add(out, path, src, node, "API-004", message, cfg, strict);
-        }
-    });
-}
-
-fn check_lofting(
-    out: &mut Vec<Finding>,
-    path: &Path,
-    src: &str,
-    function: Node,
-    cfg: &Config,
-    strict: bool,
-) {
-    let Some(parameters) = function.child_by_field_name("parameters") else {
-        return;
-    };
-    let Some(body) = function.child_by_field_name("body") else {
-        return;
-    };
-    let body_text = text(body, src);
-    let mut candidates = Vec::new();
-    let mut cursor = parameters.walk();
-    for parameter in parameters.named_children(&mut cursor) {
-        let parameter_text = text(parameter, src);
-        let name = parameter_text.split(':').next().unwrap_or("").trim();
-        if name.is_empty() || name == "self" || name == "cls" {
-            continue;
-        }
-        let query = Regex::new(&format!(r"\b{}\.[A-Za-z_]\w*\s*\(", regex::escape(name)))
-            .expect("escaped parameter name is a valid regex");
-        if query.find_iter(body_text).count() == 1
-            && Regex::new(&format!(r"\b{}\b", regex::escape(name)))
-                .expect("escaped parameter name is a valid regex")
-                .find_iter(body_text)
-                .count()
-                == 1
-        {
-            candidates.push((name.to_string(), lofting_target(body_text, name)));
-        }
-    }
-    if candidates.is_empty() {
-        return;
-    }
-    let names = candidates
-        .iter()
-        .map(|(name, _)| format!("`{name}`"))
-        .collect::<Vec<_>>();
-    let parameters = join_human(&names);
-    let targets = candidates
-        .iter()
-        .filter_map(|(_, target)| target.as_deref())
-        .collect::<HashSet<_>>();
-    let singular = candidates.len() == 1;
-    let message = if targets.len() == 1 && candidates.iter().all(|(_, target)| target.is_some()) {
-        format!(
-            "{} {} {} only queried once; loft {} queried {} to `{}`",
-            if singular { "parameter" } else { "parameters" },
-            parameters,
-            if singular { "is" } else { "are" },
-            if singular { "its" } else { "their" },
-            if singular { "value" } else { "values" },
-            targets.into_iter().next().expect("one target"),
-        )
-    } else {
-        format!(
-            "{} {} {} only queried once; loft {} queried {} into the caller",
-            if singular { "parameter" } else { "parameters" },
-            parameters,
-            if singular { "is" } else { "are" },
-            if singular { "its" } else { "their" },
-            if singular { "value" } else { "values" },
-        )
-    };
-    add(out, path, src, function, "API-002", &message, cfg, strict);
-}
-
-fn lofting_target(body: &str, parameter: &str) -> Option<String> {
-    let escaped = regex::escape(parameter);
-    let direct = Regex::new(&format!(r"\b([A-Za-z_]\w*)\s*\([^\n]*\b{}\.", escaped))
-        .expect("escaped parameter name is a valid regex");
-    if let Some(captures) = direct.captures(body) {
-        return captures.get(1).map(|target| target.as_str().to_string());
-    }
-    let assigned = Regex::new(&format!(
-        r"\b([A-Za-z_]\w*)\s*=\s*{}\.[A-Za-z_]\w*\s*\(",
-        escaped
-    ))
-    .expect("escaped parameter name is a valid regex");
-    let value = assigned.captures(body)?.get(1)?.as_str();
-    let consumer = Regex::new(&format!(
-        r"\b([A-Za-z_]\w*)\s*\(\s*{}\b",
-        regex::escape(value)
-    ))
-    .expect("captured local name is a valid regex");
-    consumer
-        .captures(body)
-        .and_then(|captures| captures.get(1))
-        .map(|target| target.as_str().to_string())
-}
-
-fn join_human(items: &[String]) -> String {
-    match items {
-        [] => String::new(),
-        [item] => item.clone(),
-        [first, second] => format!("{first} and {second}"),
-        _ => format!(
-            "{}, and {}",
-            items[..items.len() - 1].join(", "),
-            items.last().unwrap()
-        ),
-    }
-}
-
-fn check_docstring_markup(
-    out: &mut Vec<Finding>,
-    path: &Path,
-    src: &str,
-    function: Node,
-    convention: &str,
-    cfg: &Config,
-    strict: bool,
-) {
-    if !convention.eq_ignore_ascii_case("mkdocs") {
-        return;
-    }
-    let Some(parameters) = function.child_by_field_name("parameters") else {
-        return;
-    };
-    let Some(body) = function.child_by_field_name("body") else {
-        return;
-    };
-    let Some(first) = body.named_child(0) else {
-        return;
-    };
-    let docstring = text(first, src);
-    if !(docstring.starts_with("\"") || docstring.starts_with("'")) {
-        return;
-    }
-    let mut cursor = parameters.walk();
-    for parameter in parameters.named_children(&mut cursor) {
-        let name = text(parameter, src).split(':').next().unwrap_or("").trim();
-        if name.len() > 1 && docstring.contains(&format!("*{name}*")) {
-            add(
-                out,
-                path,
-                src,
-                first,
-                "DOC-001",
-                "MkDocs parameter references use backticks, not asterisks",
-                cfg,
-                strict,
-            );
-            break;
-        }
-    }
-}
-
-fn check_pytest_assertion(
-    out: &mut Vec<Finding>,
-    path: &Path,
-    src: &str,
-    assertion: Node,
-    cfg: &Config,
-    strict: bool,
-) {
-    if !path.to_string_lossy().to_ascii_lowercase().contains("test") {
-        return;
-    }
-    let statement = text(assertion, src).trim_start_matches("assert").trim();
-    let Some((left, right)) = statement.split_once("==") else {
-        return;
-    };
-    let left = left.trim();
-    let right = right.trim();
-    let right_is_literal = matches!(right.chars().next(), Some('\'' | '\"' | '[' | '{' | '('))
-        || right.parse::<f64>().is_ok()
-        || matches!(right, "True" | "False" | "None");
-    let left_is_name = left
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && !left.contains(' ');
-    if left_is_name && right_is_literal {
-        add(
-            out,
-            path,
-            src,
-            assertion,
-            "STY-002",
-            "pytest equality has the actual value on the left",
-            cfg,
-            strict,
-        );
-    }
-}
-
-fn check_widget_tooltips(
-    out: &mut Vec<Finding>,
-    path: &Path,
-    src: &str,
-    function: Node,
-    cfg: &Config,
-    strict: bool,
-) {
-    let source = text(function, src);
-    let mut widgets = HashSet::new();
-    for line in source.lines() {
-        let trimmed = line.trim();
-        if let Some((name, value)) = trimmed.split_once('=') {
-            if value.contains("Widget(")
-                || value.contains("Button(")
-                || value.contains("Label(")
-                || value.contains("ComboBox(")
-            {
-                widgets.insert(name.trim().trim_start_matches("self.").to_string());
-            }
-        }
-    }
-    for widget in widgets {
-        if !source.contains(&format!("{widget}.setToolTip(")) && !source.contains("no tooltip") {
-            add(
-                out,
-                path,
-                src,
-                function,
-                "GUI-001",
-                "widget has no static tooltip on every construction path",
-                cfg,
-                strict,
-            );
-        }
-    }
-}
-
-/// Check widgets constructed while initializing a class.  Configuration is often
-/// factored into helpers, so follow `self.method()` calls starting at `__init__`.
-/// The visited set deliberately makes recursive helper graphs finite.
-fn check_class_widget_tooltips(
-    out: &mut Vec<Finding>,
-    path: &Path,
-    src: &str,
-    class: Node,
-    cfg: &Config,
-    strict: bool,
-) {
-    let Some(body) = class.child_by_field_name("body") else {
-        return;
-    };
-    let mut methods = HashMap::new();
-    let mut cursor = body.walk();
-    for child in body.named_children(&mut cursor) {
-        if child.kind() == "function_definition" {
-            if let Some(name) = child.child_by_field_name("name") {
-                methods.insert(text(name, src).to_string(), child);
-            }
-        }
-    }
-    let Some(init) = methods.get("__init__").copied() else {
-        return;
-    };
-
-    let mut reachable = HashSet::new();
-    let mut pending = vec!["__init__".to_string()];
-    while let Some(name) = pending.pop() {
-        if !reachable.insert(name.clone()) {
-            continue;
-        }
-        let Some(method) = methods.get(&name).copied() else {
-            continue;
-        };
-        for called in called_instance_methods(method, src) {
-            if methods.contains_key(&called) && !reachable.contains(&called) {
-                pending.push(called);
-            }
-        }
-    }
-
-    let reachable_source = reachable
-        .iter()
-        .filter_map(|name| methods.get(name))
-        .map(|method| text(*method, src))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let mut widgets = HashSet::new();
-    for line in reachable_source.lines() {
-        let trimmed = line.trim();
-        if let Some((name, value)) = trimmed.split_once('=') {
-            if value.contains("Widget(")
-                || value.contains("Button(")
-                || value.contains("Label(")
-                || value.contains("ComboBox(")
-            {
-                widgets.insert(name.trim().trim_start_matches("self.").to_string());
-            }
-        }
-    }
-    for widget in widgets {
-        if !reachable_source.contains(&format!("{widget}.setToolTip("))
-            && !reachable_source.contains("no tooltip")
-        {
-            add(
-                out,
-                path,
-                src,
-                init,
-                "GUI-001",
-                "widget has no static tooltip on every construction path",
-                cfg,
-                strict,
-            );
-        }
-    }
-}
-
-fn called_instance_methods(method: Node, src: &str) -> HashSet<String> {
-    let mut calls = HashSet::new();
-    let Some(body) = method.child_by_field_name("body") else {
-        return calls;
-    };
-    walk_method_nodes(body, &mut |node| {
-        if node.kind() != "call" {
-            return;
-        }
-        let Some(function) = node.child_by_field_name("function") else {
-            return;
-        };
-        let Some(attribute) = function.child_by_field_name("attribute") else {
-            return;
-        };
-        let Some(object) = function.child_by_field_name("object") else {
-            return;
-        };
-        if text(object, src) == "self" {
-            calls.insert(text(attribute, src).to_string());
-        }
-    });
-    calls
-}
-
-fn walk_method_nodes(node: Node, f: &mut impl FnMut(Node)) {
-    f(node);
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if matches!(child.kind(), "function_definition" | "class_definition") {
-            continue;
-        }
-        walk_method_nodes(child, f);
-    }
-}
-fn check_module_order(
-    out: &mut Vec<Finding>,
-    path: &Path,
-    src: &str,
-    root: Node,
-    cfg: &Config,
-    strict: bool,
-) {
-    let mut stage = 0;
-    let mut c = root.walk();
-    for n in root.named_children(&mut c) {
-        let next = match n.kind() {
-            "class_definition" => 1,
-            "function_definition" => 2,
-            _ => 0,
-        };
-        if next < stage && next == 0 {
-            add(
-                out,
-                path,
-                src,
-                n,
-                "STY-004",
-                "module declaration appears after a class or function",
-                cfg,
-                strict,
-            );
-        }
-        stage = stage.max(next);
-    }
-}
+#[cfg(test)]
+mod permutation_tests;
 
 #[cfg(test)]
 mod tests {
