@@ -49,11 +49,19 @@ underscore-prefixed class. Set it to `false` to lint those definitions.
 
 ## Suppressions
 
-`# noqa` suppresses all diagnostics on its source line. `# colint: ignore[STY-001,API-005]` suppresses only the listed rule codes on that line; entries may also use rule names (e.g. `nested-import`) interchangeably with codes in the same bracket. For nested imports, use a `# NOTE: reason` justification comment immediately before one import or a contiguous import group; it may be multiline and blank lines do not split the group. This explicit NOTE syntax is the required guidance for generated code.
+`# noqa` suppresses all diagnostics on its source line. `# noqa: STY-001,API-005` and `# colint: ignore[STY-001,API-005]` suppress only the listed rule codes on that line; entries may also use rule names (e.g. `nested-import`) interchangeably with codes in the same bracket. For nested imports, use a `# NOTE: reason` justification comment immediately before one import or a contiguous import group; it may be multiline and blank lines do not split the group. This explicit NOTE syntax is the required guidance for generated code.
 
 ## Input and output
 
 The CLI accepts Python files and directories, recursively scans `*.py`, and ignores common generated and virtual-environment directories. Diagnostics use `path:line:column: GRP-NNN - message [severity]`, include a fix recommendation, and `--json` emits structured diagnostics. `--include-header` prepends suppression guidance to human-readable output only. Python 3.10+ syntax is targeted. Automatic rewriting is intentionally not part of this first release.
+
+## Robustness
+
+Every check works on the Tree-sitter syntax tree rather than on source text, so
+results do not depend on whitespace, CRLF line endings, tab indentation,
+comments, or backslash line continuations, and nested definitions are never
+reported twice. `src/permutation_tests.rs` enforces this: each rule's cases are
+re-run under layout transformations and every suppression form.
 
 ## Rust quality gates
 

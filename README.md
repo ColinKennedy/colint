@@ -24,9 +24,13 @@ Contributors can run the same quality gates as CI with `cargo fmt --check`,
 Rules have stable codes in the `GRP-NNN` form, grouped by check category
 (`API`, `DOC`, `STY`, `GUI` — see [Checks](#checks) below). A line may
 suppress all findings
-with `# noqa`, or selected findings with `# colint: ignore[STY-001,API-005]`.
-Rule names work too, e.g. `# colint: ignore[nested-import]`, and both forms
-may be mixed in the same bracket.
+with `# noqa`, or selected findings with `# noqa: STY-001,API-005` or
+`# colint: ignore[STY-001,API-005]`. Rule names work too, e.g.
+`# colint: ignore[nested-import]`, and both forms may be mixed in the same
+list. Codes are matched case-insensitively and spacing is flexible
+(`#colint:ignore[ sty-001 ]`). `# noqa: E501`, which names only another
+linter's codes, does not suppress colint findings. Suppressions must be real
+comments on the finding's first line; text inside a string literal is ignored.
 For a nested import (STY-001), use `# NOTE: reason` immediately above the
 import or contiguous import group; blank lines do not split that group. Use
 this NOTE form for any intentional nested import, especially generated code.
@@ -74,6 +78,55 @@ Rule codes are grouped by check category. Each group's number restarts at 1.
 | --- | --- | --- | --- |
 | GUI-001 | widget-tooltip | warning | A missing tooltip leaves users without in-app guidance. |
 | GUI-002 | qt-model-parent | error | Without a parent, Qt cannot manage the model's lifetime. |
+
+### Rule details
+
+- **Test code** (API-005 allows `assert`, STY-002 applies) is a file named
+  `test_*.py`, `*_test.py`, `test.py`, `tests.py`, or `conftest.py`, or any
+  file below a `test`, `tests`, or `testing` directory. Names that merely
+  contain "test", such as `latest.py` or `contest/`, are production code.
+- **API-001** reports a function whose first statement (after any docstring)
+  is an `if` without `elif`/`else` whose only body statement is `return`.
+- **API-002** counts real references to each parameter (not text in strings
+  or comments) and handles defaults, annotations, and multi-line calls when
+  naming the consumer. Methods decorated with `@override` are skipped because
+  their signatures are fixed by the base class.
+- **API-003** compares annotations ignoring whitespace, comments, trailing
+  commas, and quoting. `self.method()`/`cls.method()` calls are compared with
+  methods; plain calls with functions. `await` is unwrapped.
+- **API-004** recognizes any empty `str` literal (`""`, `''`, `u""`, `r""`,
+  ``, parenthesized or implicitly concatenated) and ignores returns in
+  nested functions. `Optional[...]`/`Union[..., None]` count as including
+  `None`.
+- **API-006** reports `x is None`/`x is not None` in `if`/`elif` conditions
+  when `x` is a parameter or annotated local declared `X | None`,
+  `None | X`, `Optional[X]`, or `Union[X, None]`.
+- **DOC-001** checks the function's own docstring (including raw strings) for
+  `*parameter*` or `**parameter**` markup.
+- **DOC-002** reads the Google-style `Raises:` section of the function's own
+  docstring and reports each documented exception that the function does not
+  raise directly. A bare `raise` re-raises the enclosing `except` types, and a
+  documented base class covers a raised subclass defined in the same module.
+- **STY-001** applies only inside functions and classes; module-level
+  `if TYPE_CHECKING:` and `try:`/`except ImportError:` imports are not nested.
+  A justification comment must start with `NOTE` (any case).
+- **STY-003** checks the message argument of `debug`/`info`/`warning`/
+  `error`/`exception`/`critical`/`log` calls on `logging`, `logger`, `log`,
+  `LOGGER`, `self._log`, `logging.getLogger(...)`, and similar receivers.
+  `%s` and `%(name)s` must be wrapped in matching quotes; `%r` already shows
+  quotes, and `%%` is a literal percent sign.
+- **STY-004** expects globals, then classes, then functions. Decorated
+  definitions are classified by what they decorate, comments are ignored, and
+  an `if __name__ == "__main__":` block may close the module.
+- **GUI-001** reports each widget assignment (named `*Widget`, `*Button`,
+  `*Label`, `*ComboBox`, or a local `QWidget` subclass) that has no reachable
+  `setToolTip(...)` and no non-empty `toolTip=` keyword. Within a class, every
+  method reachable through `self.` calls from, or leading to, the constructing
+  method counts. A `# no tooltip: reason` comment exempts the scope.
+- **GUI-002** treats `parent=self` or any non-literal positional argument as a
+  parent. Constructing a project model subclass also requires a parent.
+  Subclass initializers may forward `parent` by position, keyword,
+  `*args`/`**kwargs`, `super(Class, self).__init__`, or `Base.__init__(self, ...)`.
 
 ## Configuration
 
