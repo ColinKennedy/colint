@@ -1124,14 +1124,27 @@ fn doc001_permutations() {
                 """Create *x*."""
             "#,
                 r#"
-            def create(
-                task,
-                owner,
-            ):
+            def create(task):
+                """Create "task"."""
+            "#,
+                r#"
+            def create(task):
+                """Create 'task'."""
+            "#,
+                r#"
+            def create(task):
+                """Create ``task``."""
+            "#,
+                r#"
+            def create(task):
+                """Create “task”."""
+            "#,
+                r#"
+            def create(task):
                 """Create a task.
 
-                The new item is assigned to *owner*
-                and *task* is scheduled.
+                Args:
+                    task: The *task* to create.
                 """
             "#,
                 r#"
@@ -1172,25 +1185,87 @@ fn doc001_permutations() {
                 run()
                 """Create *task*."""
             "#,
+                r#"
+            def create(task):
+                """Create the task.
+
+                Args:
+                    task: Create task, foo_task, "task list", or *task.
+                """
+            "#,
+                r#"
+            def create(mode):
+                """Open with 'r' or "w" or *m*."""
+            "#,
+                r#"
+            def create(x):
+                """Create 'x'."""
+            "#,
+                r#"
+            def create(task):
+                """Create a task.
+
+                Example:
+                    >>> create("task")
+
+                ```python
+                create("task")
+                ```
+                """
+            "#,
+                r#"
+            def create(task):
+                f"""Create *task*."""
+            "#,
+            ],
+        ),
+        case(
+            "DOC-001",
+            "app.py",
+            2,
+            &[
+                r#"
+            def create(
+                task,
+                owner,
+            ):
+                """Create a task.
+
+                The new item is assigned to *owner*
+                and *task* is scheduled.
+                """
+            "#,
+                r#"
+            def create(task: int) -> None:
+                """Get *task* and print it.
+
+                Args:
+                    task: Something "task" and task.
+                """
+            "#,
             ],
         ),
     ]);
 }
 
 #[test]
-fn doc001_is_silent_for_other_conventions() {
-    let config = Config {
-        docstring_convention: "Google".into(),
-        ..Config::default()
+fn doc001_respects_configured_markup() {
+    let config: Config =
+        toml::from_str("[docstring_variable_markup]\nstart = \"``\"\nend = \"``\"\n").unwrap();
+    let findings = |source: &str| {
+        analyze(Path::new("app.py"), source, &config, false)
+            .into_iter()
+            .filter(|f| f.code == "DOC-001")
+            .count()
     };
-    assert!(!analyze(
-        Path::new("app.py"),
-        "def create(task):\n    \"\"\"Create *task*.\"\"\"\n",
-        &config,
-        false
-    )
-    .iter()
-    .any(|f| f.code == "DOC-001"));
+    assert_eq!(
+        0,
+        findings("def create(task):\n    \"\"\"Create ``task``.\"\"\"\n")
+    );
+    assert_eq!(
+        1,
+        findings("def create(task):\n    \"\"\"Create `task`.\"\"\"\n")
+    );
 }
 
 // DOC-002 direct-raises-only ------------------------------------------------

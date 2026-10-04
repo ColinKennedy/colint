@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     process::ExitCode,
 };
-use tree_sitter::{Node, Parser as TsParser};
+use tree_sitter::{Node, Parser as TsParser, Point};
 use walkdir::{DirEntry, WalkDir};
 
 /// A regex compiled once, on first use.
@@ -30,7 +30,7 @@ const RULES: &[Rule] = &[
     Rule::new("API-005", "assert-in-production", Severity::Error, "Raise an explicit exception instead of assert in non-test code."),
     Rule::new("API-006", "none-polymorphism", Severity::Warning, "Prefer a polymorphic truthiness check (`if value:`) for a Foo | None value."),
     // DOC — documentation
-    Rule::new("DOC-001", "docstring-convention", Severity::Warning, "Use the configured docstring markup for parameters mentioned in the summary."),
+    Rule::new("DOC-001", "docstring-convention", Severity::Warning, "Wrap parameter names in docstrings with the configured variable markup (backticks by default)."),
     Rule::new("DOC-002", "direct-raises-only", Severity::Error, "Document Raises only for exceptions raised directly by this function."),
     // STY — style and organization
     Rule::new("STY-001", "nested-import", Severity::Error, "Move the import to module scope, or add an immediately preceding NOTE comment explaining why it is nested."),
@@ -102,9 +102,6 @@ struct Config {
     warnings_as_errors: bool,
     #[serde(default)]
     rules: HashMap<String, bool>,
-    /// The markup used when referring to parameters in docstrings.
-    #[serde(default = "default_docstring_convention")]
-    docstring_convention: String,
     /// Whether API-002 skips underscore-prefixed functions, methods, and classes.
     #[serde(default = "default_api002_skip_private_definitions")]
     api002_skip_private_definitions: bool,
@@ -112,9 +109,27 @@ struct Config {
     /// `.colint.toml` are relative to that file unless already absolute.
     #[serde(default)]
     import_paths: Vec<PathBuf>,
+    /// The markup DOC-001 expects around parameter names in docstrings.
+    #[serde(default)]
+    docstring_variable_markup: VariableMarkup,
 }
-fn default_docstring_convention() -> String {
-    "mkdocs".into()
+#[derive(serde::Deserialize, Clone, PartialEq, Eq, Debug)]
+struct VariableMarkup {
+    #[serde(default = "default_variable_markup_delimiter")]
+    start: String,
+    #[serde(default = "default_variable_markup_delimiter")]
+    end: String,
+}
+fn default_variable_markup_delimiter() -> String {
+    "`".into()
+}
+impl Default for VariableMarkup {
+    fn default() -> Self {
+        Self {
+            start: default_variable_markup_delimiter(),
+            end: default_variable_markup_delimiter(),
+        }
+    }
 }
 fn default_api002_skip_private_definitions() -> bool {
     true
@@ -124,9 +139,9 @@ impl Default for Config {
         Self {
             warnings_as_errors: false,
             rules: HashMap::new(),
-            docstring_convention: default_docstring_convention(),
             api002_skip_private_definitions: default_api002_skip_private_definitions(),
             import_paths: Vec::new(),
+            docstring_variable_markup: VariableMarkup::default(),
         }
     }
 }
@@ -394,8 +409,12 @@ impl<'a> Linter<'a> {
         if !enabled(code, self.cfg, self.strict) || suppressed(node, self.src, code) {
             return;
         }
+        self.push(node.start_position(), code, message);
+    }
+
+    /// Records a finding at `p` without checking enablement or suppressions.
+    fn push(&mut self, p: Point, code: &str, message: &str) {
         let r = rule(code);
-        let p = node.start_position();
         self.out.push(Finding {
             path: self.path.display().to_string(),
             line: p.row + 1,
@@ -660,8 +679,12 @@ impl<'a> Linter<'a> {
 
     // DOC-001 -------------------------------------------------------------
 
+    /// Reports each parameter name in the function's own docstring that is
+    /// wrapped in markup other than the configured `[docstring_variable_markup]`,
+    /// such as `*bar*`, `"bar"`, or ``` ``bar`` ``` instead of `` `bar` ``.
     fn check_docstring_markup(&mut self, function: Node) {
-        if !self.cfg.docstring_convention.eq_ignore_ascii_case("mkdocs") {
+        let code = "DOC-001";
+        if !enabled(code, self.cfg, self.strict) {
             return;
         }
         let Some(parameters) = function.child_by_field_name("parameters") else {
@@ -670,21 +693,40 @@ impl<'a> Linter<'a> {
         let Some(docstring) = docstring(function) else {
             return;
         };
-        let emphasized = emphasized_words(self.text(docstring));
+        let Some(body) = string_body_range(docstring, self.src) else {
+            return;
+        };
+        let mut names = Vec::new();
         for parameter in code_children(parameters) {
-            let Some((name, _)) = parameter_name(parameter, self.src) else {
-                continue;
-            };
-            if emphasized.contains(name) {
-                self.report(
-                    function,
-                    "DOC-001",
-                    &format!(
-                        "MkDocs parameter references use backticks, not asterisks: write `{name}`"
-                    ),
-                );
-                break;
+            if let Some((name, _)) = parameter_name(parameter, self.src) {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
             }
+        }
+        let markup = &self.cfg.docstring_variable_markup;
+        let references = wrapped_parameter_references(&self.src[body.clone()], &names, markup);
+        // A comment can only follow the closing quotes, so a suppression there
+        // or on the `def` line covers the whole docstring.
+        let docstring_suppressed = suppressed(function, self.src, code)
+            || suppressed_on_row(function, docstring.end_position().row, self.src, code);
+        for reference in references {
+            let byte = body.start + reference.offset;
+            let p = point_at(self.src, byte);
+            if docstring_suppressed || suppressed_on_row(function, p.row, self.src, code) {
+                continue;
+            }
+            let WrappedReference {
+                name, open, close, ..
+            } = reference;
+            let VariableMarkup { start, end } = markup;
+            self.push(
+                p,
+                code,
+                &format!(
+                    "parameter {name} is written as {open}{name}{close}; use {start}{name}{end}"
+                ),
+            );
         }
     }
 
@@ -1154,6 +1196,11 @@ fn docstring(definition: Node) -> Option<Node> {
 /// The raw source between a string's quotes, unless it is a bytes or
 /// f-string literal.
 fn string_body<'a>(string: Node, src: &'a str) -> Option<&'a str> {
+    string_body_range(string, src).map(|range| &src[range])
+}
+
+/// The byte range of [`string_body`] within `src`.
+fn string_body_range(string: Node, src: &str) -> Option<std::ops::Range<usize>> {
     if string.kind() != "string" {
         return None;
     }
@@ -1165,7 +1212,7 @@ fn string_body<'a>(string: Node, src: &'a str) -> Option<&'a str> {
     if prefix.contains('b') || prefix.contains('f') {
         return None;
     }
-    Some(&src[start.end_byte()..end.start_byte()])
+    Some(start.end_byte()..end.start_byte())
 }
 
 fn is_empty_string(node: Node, src: &str) -> bool {
@@ -1238,7 +1285,12 @@ fn class_methods<'t>(class_body: Node<'t>, src: &str) -> HashMap<String, Node<'t
 /// Suppressions are read from real comments on the finding's first line, so
 /// `# noqa` inside a string literal does not hide anything.
 fn suppressed(node: Node, src: &str, code: &str) -> bool {
-    let row = node.start_position().row;
+    suppressed_on_row(node, node.start_position().row, src, code)
+}
+
+/// Whether a real comment on `row` of the tree containing `node` suppresses
+/// `code`.
+fn suppressed_on_row(node: Node, row: usize, src: &str, code: &str) -> bool {
     let mut root = node;
     while let Some(parent) = root.parent() {
         root = parent;
@@ -1537,21 +1589,153 @@ fn optional_names(function: Node, src: &str) -> HashSet<String> {
 
 // DOC-001 helpers -----------------------------------------------------------
 
-/// Words written as `*word*` or `**word**`, not embedded in a longer word or
-/// expression such as `2*x*3`.
-fn emphasized_words(docstring: &str) -> HashSet<&str> {
-    let emphasis = static_regex!(r"\*\*?([A-Za-z_]\w*)\*\*?");
-    let boundary =
-        |c: Option<char>| c.map_or(true, |c| !(c.is_alphanumeric() || c == '_' || c == '*'));
-    emphasis
-        .captures_iter(docstring)
-        .filter(|captures| {
-            let whole = captures.get(0).expect("whole match");
-            boundary(docstring[..whole.start()].chars().next_back())
-                && boundary(docstring[whole.end()..].chars().next())
+/// A parameter name in a docstring wrapped by a matching pair of markup
+/// characters, e.g. `*bar*`; `offset` is the byte offset of the opening markup.
+#[derive(Debug, PartialEq, Eq)]
+struct WrappedReference<'a> {
+    offset: usize,
+    name: &'a str,
+    open: &'a str,
+    close: &'a str,
+}
+
+/// Characters that may wrap a parameter name to mark it up in a docstring.
+fn is_variable_wrapper(c: char) -> bool {
+    matches!(
+        c,
+        '*' | '"' | '\'' | '`' | '\u{201C}' | '\u{201D}' | '\u{2018}' | '\u{2019}'
+    )
+}
+
+fn is_identifier_char(c: char) -> bool {
+    c == '_' || c.is_alphanumeric()
+}
+
+/// The closing markup expected for an opening run, e.g. `**` for `**` and a
+/// right curly quote for a left curly quote.
+fn mirrored_wrapper(open: &str) -> String {
+    open.chars()
+        .rev()
+        .map(|c| match c {
+            '\u{201C}' => '\u{201D}',
+            '\u{2018}' => '\u{2019}',
+            other => other,
         })
-        .map(|captures| captures.get(1).expect("word group").as_str())
         .collect()
+}
+
+/// Every reference to one of `names` in `docstring` that is wrapped in markup
+/// other than `markup`. Bare names are ignored because they may not refer to
+/// the parameter, as are Google-style `name:` entries, doctest examples, fenced
+/// code blocks, and words embedded in an expression such as `2*x*3`. A
+/// one-character name is only reported for `*x*`/`**x**` emphasis because a
+/// quoted single character is usually a value, such as mode `'r'`.
+fn wrapped_parameter_references<'a>(
+    docstring: &'a str,
+    names: &[&str],
+    markup: &VariableMarkup,
+) -> Vec<WrappedReference<'a>> {
+    let start_run: String = {
+        let run: Vec<char> = markup
+            .start
+            .chars()
+            .rev()
+            .take_while(|c| is_variable_wrapper(*c))
+            .collect();
+        run.into_iter().rev().collect()
+    };
+    let end_run: String = markup
+        .end
+        .chars()
+        .take_while(|c| is_variable_wrapper(*c))
+        .collect();
+    let mut references = Vec::new();
+    let mut in_fence = false;
+    let mut in_doctest = false;
+    let mut line_start = 0;
+    for raw_line in docstring.split_inclusive('\n') {
+        let offset = line_start;
+        line_start += raw_line.len();
+        let line = raw_line.trim_end_matches(['\n', '\r']);
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if trimmed.is_empty() {
+            in_doctest = false;
+            continue;
+        }
+        if trimmed.starts_with(">>>") {
+            in_doctest = true;
+        }
+        if in_fence || in_doctest {
+            continue;
+        }
+        let mut matches: Vec<_> = names
+            .iter()
+            .flat_map(|name| line.match_indices(*name))
+            .collect();
+        matches.sort_unstable();
+        for (i, name) in matches {
+            let before = &line[..i];
+            let after = &line[i + name.len()..];
+            if before.chars().next_back().is_some_and(is_identifier_char)
+                || after.chars().next().is_some_and(is_identifier_char)
+            {
+                continue;
+            }
+            let open_len: usize = before
+                .chars()
+                .rev()
+                .take_while(|c| is_variable_wrapper(*c))
+                .map(char::len_utf8)
+                .sum();
+            let close_len: usize = after
+                .chars()
+                .take_while(|c| is_variable_wrapper(*c))
+                .map(char::len_utf8)
+                .sum();
+            let open = &before[before.len() - open_len..];
+            let close = &after[..close_len];
+            if open.is_empty() || close != mirrored_wrapper(open) {
+                continue;
+            }
+            let outside_before = before[..before.len() - open_len].chars().next_back();
+            let outside_after = after[close_len..].chars().next();
+            if outside_before.is_some_and(is_identifier_char)
+                || outside_after.is_some_and(is_identifier_char)
+            {
+                continue;
+            }
+            if name.chars().count() == 1 && open.chars().any(|c| c != '*') {
+                continue;
+            }
+            let configured = before.ends_with(markup.start.as_str())
+                && after.starts_with(markup.end.as_str())
+                && open == start_run
+                && close == end_run;
+            if configured {
+                continue;
+            }
+            references.push(WrappedReference {
+                offset: offset + i - open_len,
+                name,
+                open,
+                close,
+            });
+        }
+    }
+    references
+}
+
+/// The row and byte column of `byte` in `src`, as Tree-sitter reports them.
+fn point_at(src: &str, byte: usize) -> Point {
+    let line_start = src[..byte].rfind('\n').map_or(0, |i| i + 1);
+    Point {
+        row: src[..byte].matches('\n').count(),
+        column: byte - line_start,
+    }
 }
 
 // DOC-002 helpers -----------------------------------------------------------
@@ -2227,9 +2411,9 @@ def ignored():
         let config = Config {
             warnings_as_errors: false,
             rules: HashMap::from([("API-005".to_string(), false)]),
-            docstring_convention: default_docstring_convention(),
             api002_skip_private_definitions: default_api002_skip_private_definitions(),
             import_paths: Vec::new(),
+            docstring_variable_markup: VariableMarkup::default(),
         };
         let normal = analyze(
             Path::new("production.py"),
@@ -2366,12 +2550,78 @@ def run():
     }
 
     #[test]
-    fn mkdocs_docstrings_reject_asterisk_parameter_markup() {
+    fn docstrings_reject_asterisk_parameter_markup() {
         assert!(codes(
             "def create(task):\n    \"\"\"Create *task*.\"\"\"\n",
             "app.py"
         )
         .contains(&"DOC-001".to_string()));
+    }
+
+    fn doc001_messages(source: &str, config: &Config) -> Vec<String> {
+        analyze(Path::new("app.py"), source, config, false)
+            .into_iter()
+            .filter(|finding| finding.code == "DOC-001")
+            .map(|finding| format!("{}:{} {}", finding.line, finding.column, finding.message))
+            .collect()
+    }
+
+    #[test]
+    fn docstring_variable_markup_flags_wrapped_parameters_only() {
+        let source = r#"def foo(bar: int) -> None:
+    """Get *bar* and print it.
+
+    Args:
+        bar: Something something "bar" and *bar* and bar.
+
+    """
+    print(bar)
+"#;
+        assert_eq!(
+            vec![
+                "2:12 parameter bar is written as *bar*; use `bar`",
+                "5:34 parameter bar is written as \"bar\"; use `bar`",
+                "5:44 parameter bar is written as *bar*; use `bar`",
+            ],
+            doc001_messages(source, &Config::default())
+        );
+    }
+
+    #[test]
+    fn docstring_variable_markup_flags_other_wrappers_and_splat_names() {
+        let source = "def foo(bar, *args, mode='r', **kwargs):\n    \"\"\"Use ``bar``, 'mode', *args*, and **kwargs**.\"\"\"\n";
+        assert_eq!(
+            vec![
+                "2:12 parameter bar is written as ``bar``; use `bar`",
+                "2:21 parameter mode is written as 'mode'; use `mode`",
+                "2:29 parameter args is written as *args*; use `args`",
+                "2:41 parameter kwargs is written as **kwargs**; use `kwargs`",
+            ],
+            doc001_messages(source, &Config::default())
+        );
+    }
+
+    #[test]
+    fn docstring_variable_markup_is_configurable() {
+        let config: Config =
+            toml::from_str("[docstring_variable_markup]\nstart = \"``\"\nend = \"``\"\n").unwrap();
+        let source = "def foo(bar, baz):\n    \"\"\"Use ``bar`` and `baz`.\"\"\"\n";
+        assert_eq!(
+            vec!["2:24 parameter baz is written as `baz`; use ``baz``"],
+            doc001_messages(source, &config)
+        );
+        // `docstring_convention` was removed; existing configs must still load.
+        let legacy: Config = toml::from_str("docstring_convention = \"google\"\n").unwrap();
+        assert_eq!(VariableMarkup::default(), legacy.docstring_variable_markup);
+    }
+
+    #[test]
+    fn docstring_variable_markup_suppressions_cover_the_whole_docstring() {
+        let multiline = "def foo(bar):\n    \"\"\"Use *bar*.\n\n    And \"bar\".\n    \"\"\"  # noqa: DOC-001\n";
+        assert!(doc001_messages(multiline, &Config::default()).is_empty());
+        let on_def =
+            "def foo(bar):  # colint: ignore[docstring-convention]\n    \"\"\"Use *bar*.\"\"\"\n";
+        assert!(doc001_messages(on_def, &Config::default()).is_empty());
     }
 
     #[test]
@@ -2601,9 +2851,9 @@ class Window:
         let config = Config {
             warnings_as_errors: false,
             rules: HashMap::from([("API-001".to_string(), false)]),
-            docstring_convention: default_docstring_convention(),
             api002_skip_private_definitions: default_api002_skip_private_definitions(),
             import_paths: Vec::new(),
+            docstring_variable_markup: VariableMarkup::default(),
         };
         let source = "def run(value):\n    if not value:\n        return\n    work()\n";
         assert!(!analyze(Path::new("app.py"), source, &config, false)
@@ -2612,21 +2862,6 @@ class Window:
         assert!(analyze(Path::new("app.py"), source, &config, true)
             .iter()
             .any(|finding| finding.code == "API-001"));
-    }
-
-    #[test]
-    fn non_mkdocs_convention_disables_mkdocs_markup_advice() {
-        let config = Config {
-            warnings_as_errors: false,
-            rules: HashMap::new(),
-            docstring_convention: "google".to_string(),
-            api002_skip_private_definitions: default_api002_skip_private_definitions(),
-            import_paths: Vec::new(),
-        };
-        let source = "def create(task):\n    \"\"\"Create *task*.\"\"\"\n";
-        assert!(!analyze(Path::new("app.py"), source, &config, false)
-            .iter()
-            .any(|finding| finding.code == "DOC-001"));
     }
 
     #[test]

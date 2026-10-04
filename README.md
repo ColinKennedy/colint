@@ -60,7 +60,7 @@ Rule codes are grouped by check category. Each group's number restarts at 1.
 
 | Code | Rule | Severity | Justification |
 | --- | --- | --- | --- |
-| DOC-001 | docstring-convention | warning | Inconsistent parameter markup breaks generated documentation. |
+| DOC-001 | docstring-convention | warning | Mixed `*bar*`, `"bar"`, and `` `bar` `` parameter markup breaks generated documentation. |
 | DOC-002 | direct-raises-only | error | Documenting inherited raises hides which errors this call owns. |
 
 ### STY — Style & Organization
@@ -102,7 +102,13 @@ Rule codes are grouped by check category. Each group's number restarts at 1.
   when `x` is a parameter or annotated local declared `X | None`,
   `None | X`, `Optional[X]`, or `Union[X, None]`.
 - **DOC-001** checks the function's own docstring (including raw strings) for
-  `*parameter*` or `**parameter**` markup.
+  parameter names wrapped in markup other than the configured
+  `[docstring_variable_markup]` (`` `name` `` by default): `*name*`,
+  `**name**`, `"name"`, `'name'`, ``` ``name`` ```, or curly quotes. Each
+  occurrence is reported. Bare names, Google-style `name:` entries, doctest
+  examples, fenced code blocks, and expressions such as `2*x*3` are ignored. A
+  one-character name is reported only for `*x*`/`**x**` emphasis. Suppress it
+  on the `def` line or after the docstring's closing quotes.
 - **DOC-002** reads the Google-style `Raises:` section of the function's own
   docstring and reports each documented exception that the function does not
   raise directly. A bare `raise` re-raises the enclosing `except` types, and a
@@ -134,13 +140,18 @@ Create `.colint.toml` in the working directory (or a parent directory):
 
 ```toml
 warnings_as_errors = false
-docstring_convention = "mkdocs"
 # API-002 skips private definitions by default. Private means an underscore-
 # prefixed function or method, or any member of an underscore-prefixed class.
 api002_skip_private_definitions = true
 # Additional Python package roots used to resolve imported Qt model/proxy bases.
 # Relative paths are resolved from this configuration file.
 import_paths = ["../shared-python", "C:/work/company-python"]
+
+# DOC-001 markup expected around parameter names in docstrings. Both default
+# to a single backtick, the Markdown inline-code syntax.
+[docstring_variable_markup]
+start = "`"
+end = "`"
 
 [rules]
 STY-001 = true
@@ -152,7 +163,9 @@ configuration and treats warnings as errors. Exit status is `0` for clean runs
 and ordinary warnings, `1` for warnings escalated to errors, and `2` whenever
 an error-level finding exists.
 
-`docstring_convention = "mkdocs"` enables the MkDocs parameter-markup check.
+`[docstring_variable_markup]` sets the `start` and `end` markup DOC-001
+expects around parameter names in docstrings. The former
+`docstring_convention` setting is no longer used and is ignored if present.
 `api002_skip_private_definitions = false` makes API-002 lint private functions,
 methods, and class members too.
 `import_paths` supplements `PYTHONPATH` when `GUI-002` resolves imported
